@@ -1,0 +1,24 @@
+# Google OAuth credentials — NEVER commit these
+credentials.json
+token.json
+*.json
+!package.json
+
+# Environment variables — contains secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Daily rate limit counter (local state)
+.send_count
+
+# OS files
+.DS_Store
+Thumbs.db
