@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gmail MCP Server — Service Account with domain-wide delegation."""
+"""Gmail MCP Server — OAuth2 user credentials (no domain-wide delegation)."""
 
 import base64
 import os
@@ -8,7 +8,9 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
 
-from google.oauth2 import service_account
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from mcp.server.fastmcp import FastMCP
 
@@ -18,16 +20,24 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
 
-SERVICE_ACCOUNT_FILE = Path.home() / ".config" / "claude-gmail" / "service-account.json"
-DELEGATED_USER = os.environ.get("GMAIL_DELEGATED_USER", "clark@willcrestpartners.com")
+CONFIG_DIR = Path.home() / ".config" / "claude-gmail"
+CLIENT_SECRETS = CONFIG_DIR / "client_secrets.json"
+TOKEN_FILE = CONFIG_DIR / "token.json"
 
 mcp = FastMCP("gmail")
 
 
 def _gmail():
-    creds = service_account.Credentials.from_service_account_file(
-        str(SERVICE_ACCOUNT_FILE), scopes=SCOPES
-    ).with_subject(DELEGATED_USER)
+    creds = None
+    if TOKEN_FILE.exists():
+        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRETS), SCOPES)
+            creds = flow.run_local_server(port=0)
+        TOKEN_FILE.write_text(creds.to_json())
     return build("gmail", "v1", credentials=creds)
 
 
@@ -152,10 +162,8 @@ def get_thread(thread_id: str) -> str:
     for msg in thread.get("messages", []):
         h = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
         body = _extract_body(msg["payload"])[:2000]
-        output.append(
-            f"From: {h.get('From','')}\nDate: {h.get('Date','')}\n\n{body}"
-        )
-    return "\n\n" + ("=" * 60) + "\n\n".join(output)
+        output.append(f"From: {h.get('From','')}\nDate: {h.get('Date','')}\n\n{body}")
+    return ("\n\n" + "=" * 60 + "\n\n").join(output)
 
 
 if __name__ == "__main__":
