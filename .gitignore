@@ -16,7 +16,11 @@ venv/
 dist/
 build/
 
-# Daily rate limit counter (local state)
+# Live config and logs — server-only, never in GitHub
+email_tool/config.json
+email_tool/audit_log.jsonl
+
+# Daily rate limit counter (local state, legacy)
 .send_count
 
 # OS files

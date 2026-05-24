@@ -1,0 +1,34 @@
+{
+  "global": {
+    "sender_email": "clark@willcrestpartners.com",
+    "default_daily_limit": 20,
+    "confirmation_required": true,
+    "copy_to_sent_folder": true
+  },
+  "users": {
+    "admin@yourcompany.com": {
+      "name": "Admin Name",
+      "role": "admin",
+      "daily_limit": 20,
+      "active": true
+    },
+    "developer@yourcompany.com": {
+      "name": "Developer Name",
+      "role": "user",
+      "daily_limit": 20,
+      "active": true
+    },
+    "user2@yourcompany.com": {
+      "name": "User Two",
+      "role": "user",
+      "daily_limit": 10,
+      "active": true
+    },
+    "user3@yourcompany.com": {
+      "name": "User Three",
+      "role": "user",
+      "daily_limit": 10,
+      "active": false
+    }
+  }
+}
