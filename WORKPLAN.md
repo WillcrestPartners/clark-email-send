@@ -1,5 +1,31 @@
-# Email Application Workplan
-## Sending Email from clark@willcrestpartners.com via Claude Code & Cowork
+# Clark Email Tool — Workplan
+## Sending Email from clark@willcrestpartners.com via Claude Cowork
+
+---
+
+## Who This Is For
+
+This workplan assumes:
+- **You and one associate** are learning to build with AI assistance ("vibe coding") — no
+  prior coding experience required. Claude guides you through every step.
+- **Two other team members** are non-technical. Once Clark is set up, they interact
+  entirely through Claude Cowork — no terminals, no code, no credentials.
+- **Nobody** is a professional developer. Every step in this document is written
+  accordingly.
+
+---
+
+## How Vibe Coding Works Here
+
+You are not writing code from scratch. Instead:
+1. You describe what you want in plain English (in Claude Code or Claude Cowork)
+2. Claude writes the code
+3. You review what was written (Claude explains each piece)
+4. You approve it and Claude runs or deploys it
+
+Think of Claude as a contractor who builds exactly what you specify, explains every
+decision, and asks before doing anything risky. Your job is to understand what's
+being built well enough to make good decisions — not to write the code yourself.
 
 ---
 
@@ -7,341 +33,395 @@
 
 | Question | Your Answer |
 |----------|-------------|
-| Who can send? | All 4 team members (2 coding, 2 non-coding) |
+| Who can send email? | All 4 team members |
 | Access model | Per-individual grant — admin controls who is active |
-| Sent folder | Yes — sent emails appear in Gmail Sent folder |
-| Daily limit | Default 20/day, configurable per user |
+| Sent folder | Yes — appears in Gmail Sent folder |
+| Daily limit | Default 20/day per user, configurable |
 | Recipient restriction | None — any email address allowed |
-| Confirmation required | Yes — always show preview, require "yes" before sending |
-| Where to use it | Claude Cowork (AI project interface) AND Claude Code |
+| Confirmation required | Yes — always show preview, require approval before sending |
+| Where to use it | Claude Cowork (primary) and Claude Code |
+| Hosting | AWS App Runner (using existing AWS account) |
 
 ---
 
-## What We're Building
-
-A **Clark email tool** that team members can invoke inside a Claude Cowork project
-or Claude Code session. Clark (your AI assistant) can compose and send emails from
-`clark@willcrestpartners.com` with human confirmation at every step.
-
-An **admin dashboard** accessible to authorized admins shows:
-- Who has access and whether they are active
-- Per-user daily limits and how many emails they've sent today
-- An audit log of every send attempt (success or failure, with reason)
-- All configurable settings in one place
-
----
-
-## The Plain-English Architecture
-
-This is the updated architecture. The key addition is the **MCP Server** — explained below.
+## Plain-English Architecture (Final)
 
 ```
-Team member (in Claude Cowork project or Claude Code)
-      │
-      │  "Clark, email this to John"  OR  /send-email
-      ▼
-┌──────────────────────────────────────┐
-│         Clark (Claude AI)             │  ← your AI assistant in Cowork
-│   knows about the email tool and      │
-│   asks you the confirmation questions │
-└──────────────┬───────────────────────┘
-               │  calls tool via MCP
-               ▼
-┌──────────────────────────────────────┐
-│         MCP Server (Python)           │  ← always-running small program
-│   Tools exposed:                      │     hosted on a server (see Phase 1)
-│   • send_email                        │
-│   • show_dashboard (admin only)       │
-│   • check_my_access                   │
-└──────────────┬───────────────────────┘
-               │  reads config + writes logs
-               ▼
-┌──────────────────────────────────────┐
-│   config.json  +  audit_log.jsonl    │  ← who has access, limits, all settings,
-│   (on the server)                    │     complete history of every email
-└──────────────┬───────────────────────┘
-               │  authenticates with Google
-               ▼
-┌──────────────────────────────────────┐
-│   Gmail API (Service Account)         │  ← sends from clark@willcrestpartners.com
-│                                       │     adds to Gmail Sent folder
-└──────────────────────────────────────┘
+You or a team member (in Claude Cowork)
+        │
+        │  "Clark, send this email to John"
+        ▼
+┌───────────────────────────────────────┐
+│          Clark (Claude AI)             │  Your AI assistant inside Cowork.
+│  Asks questions, shows preview,        │  Understands natural language.
+│  waits for your "yes" before acting.   │
+└───────────────┬───────────────────────┘
+                │  calls the email tool via MCP
+                │  (secure internet connection)
+                ▼
+┌───────────────────────────────────────┐
+│      MCP Server on AWS App Runner      │  A small always-running program
+│  • Checks: are you authorized?         │  in your AWS account.
+│  • Checks: daily limit OK?             │  AWS App Runner keeps it running
+│  • Logs the attempt                    │  and gives it a secure web address.
+│  • Calls Gmail on your behalf          │
+└───────────────┬───────────────────────┘
+                │  reads config, writes logs
+                ▼
+┌───────────────────────────────────────┐
+│  config.json — your user access list   │  Who can send, what limits, settings.
+│  audit_log.jsonl — the paper trail     │  Every attempt recorded here.
+└───────────────┬───────────────────────┘
+                │  authenticates with Google
+                ▼
+┌───────────────────────────────────────┐
+│  Gmail API (Google Service Account)    │  Sends from clark@willcrestpartners.com
+│                                        │  Copies to Gmail Sent folder.
+└───────────────────────────────────────┘
 ```
 
 ---
 
-## New Concept: What is an MCP Server?
+## What is AWS App Runner?
 
-**MCP stands for Model Context Protocol.** It is an open standard (created by Anthropic)
-that lets Claude talk to external tools and services.
+AWS App Runner is Amazon's simplest hosting service. You give it your GitHub
+repository and it handles everything else:
+- Builds your application automatically
+- Gives it a secure `https://` web address
+- Keeps it running 24/7
+- Automatically redeploys when you push new code to GitHub
 
-Think of it like a **plugin system**. When you add an MCP server to a Claude Cowork
-project, Claude gains new abilities — in this case, the ability to send email.
+**Cost:** Approximately $5–10/month for this project's traffic level.
 
-The MCP server is a small Python program that:
-1. Runs continuously on a server (like a small web service)
-2. Exposes "tools" that Claude can call (send_email, show_dashboard, etc.)
-3. Handles authentication so Claude never touches your credentials directly
-
-**Without an MCP server**, this tool only works when you manually run a script from
-a terminal. **With an MCP server**, Clark can use it seamlessly inside a Cowork
-project conversation.
+You already have an AWS account, so there's no new signup needed. The setup
+involves clicking through the AWS web console — no command-line work.
 
 ---
 
-## New Concept: Service Account vs. Personal OAuth
+## Security Guardrails Summary
 
-In the first draft, each user would have logged in with their own Google account.
-That approach doesn't scale well across four people.
-
-Instead, we will use a **Google Service Account** — a special Google identity that
-belongs to the application (not to any person). Think of it like a staff badge issued
-to "Clark the AI Assistant" rather than to any individual employee.
-
-The service account gets one permission: send email on behalf of
-`clark@willcrestpartners.com`. No inbox access, no deletions.
-
-**Security improvement:** The service account credential file lives only on the MCP
-server. Team members never handle Google credentials at all. Access is controlled by
-our own user list, not by Google.
+| Guardrail | What It Prevents |
+|-----------|-----------------|
+| IAM user with limited permissions | A mistake in this project can't affect other things in your AWS account |
+| Billing alert at $20 | You get an email if costs unexpectedly spike |
+| Service Account (not your password) | Google credentials are never exposed to team members |
+| config.json not in GitHub | User access list never accidentally published |
+| Per-user active flag | Suspend anyone's access instantly without touching Google |
+| Daily send limit | Accidental loops or mistakes can't send hundreds of emails |
+| Confirmation gate | Clark always shows a preview and waits for "yes" |
+| Audit log | Every attempt recorded — always know who sent what and why it failed |
+| Single recipient only | No mass-email capability — tool only accepts one `to` address |
+| `gmail.send` scope only | The service account cannot read, delete, or manage your Gmail inbox |
 
 ---
 
-## New Concept: The Admin Dashboard
+## Phase 0 — AWS Safety Setup
+### Time: ~30 minutes | Who: You | Where: AWS website (browser)
 
-Instead of a separate web app, the dashboard is built into the MCP server as a tool.
-When you (as admin) ask Clark "show me the email dashboard," Clark calls the
-`show_dashboard` tool and displays something like:
+Do this before anything else. It protects your AWS account from surprise costs
+and limits the blast radius if anything goes wrong.
+
+---
+
+**Step 0.1 — Set Up a Billing Alert**
+
+This emails you if your AWS bill exceeds a threshold. Takes 5 minutes.
+
+1. Log in to `console.aws.amazon.com`
+2. In the top search bar, type **Billing** and click "Billing and Cost Management"
+3. In the left sidebar, click **Budgets**
+4. Click the orange **Create budget** button
+5. Choose **Use a template** → select **Monthly cost budget**
+6. Set the budget amount to **$20**
+7. Enter your email address for notifications
+8. Click **Create budget**
+
+You will now receive an email if your AWS charges approach $20 in a month.
+For this project, your bill should be well under $10/month.
+
+---
+
+**Step 0.2 — Create an IAM User for This Project**
+
+Your AWS root account (the one you signed up with) has unlimited power.
+We create a limited sub-account ("IAM user") for this project so that a mistake
+here cannot affect anything else in your AWS account.
+
+1. In the AWS search bar, type **IAM** and click "IAM"
+2. In the left sidebar, click **Users**
+3. Click the orange **Create user** button
+4. Username: `clark-email-tool`
+5. Check the box: **Provide user access to the AWS Management Console** → No
+   (this user is for programmatic access only)
+6. Click **Next**
+7. On the permissions page, choose **Attach policies directly**
+8. Search for and check: `AWSAppRunnerFullAccess`
+9. Search for and check: `AmazonEC2ContainerRegistryFullAccess`
+10. Click **Next** → **Create user**
+11. Click on the new user → **Security credentials** tab → **Create access key**
+12. Choose **Application running outside AWS**
+13. Download the CSV file — store it safely. This is the user's credential.
+    **Do not upload this to GitHub.**
+
+> **Why this matters:** If you ever need to revoke this user's access (e.g., if
+> the credentials were accidentally exposed), you can delete it in IAM without
+> affecting your main AWS account or any other services.
+
+---
+
+## Phase 1 — Google Cloud Setup
+### Time: ~45 minutes | Who: You | Where: Google Cloud website (browser)
+
+---
+
+**Step 1.1 — Create a Google Cloud Project**
+
+1. Go to `console.cloud.google.com`
+2. Sign in with your **Google Workspace admin account**
+   (the account that manages `willcrestpartners.com` — not your personal Gmail)
+3. At the top of the page, click the project dropdown (it may say "Select a project")
+4. Click **New Project**
+5. Project name: `willcrest-clark-email`
+6. Click **Create**
+7. Wait a few seconds, then click the dropdown again and select your new project
+
+---
+
+**Step 1.2 — Enable the Gmail API**
+
+1. In the search bar at the top, type **Gmail API**
+2. Click the result that says "Gmail API" under APIs & Services
+3. Click the blue **Enable** button
+4. Wait for it to activate (takes about 10 seconds)
+
+---
+
+**Step 1.3 — Create a Service Account**
+
+A service account is an identity for your application — not a person.
+Think of it as a staff badge issued to "Clark" rather than to any employee.
+
+1. In the left sidebar, click **APIs & Services** → **Credentials**
+2. Click **+ Create Credentials** → **Service account**
+3. Service account name: `clark-email-sender`
+4. Service account ID: leave as auto-filled
+5. Description: `Sends email from clark@willcrestpartners.com on behalf of the team`
+6. Click **Create and continue**
+7. Skip the optional role/access steps — click **Done**
+8. You'll see your new service account listed. Click on its email address.
+9. Click the **Keys** tab → **Add Key** → **Create new key**
+10. Choose **JSON** → **Create**
+11. A JSON file downloads automatically — this is your service account key.
+    **Store it safely. Never upload it to GitHub.**
+
+---
+
+**Step 1.4 — Note the Service Account's "Client ID"**
+
+1. While still on the service account page, click the **Details** tab
+2. Copy the number shown as **Unique ID** — you'll need it in the next step.
+   It looks something like: `108234567890123456789`
+
+---
+
+**Step 1.5 — Grant Gmail Send Permission in Google Workspace Admin**
+
+This is the step that tells Google: "Clark's service account is allowed to
+send email as clark@willcrestpartners.com."
+
+1. Open a new browser tab and go to `admin.google.com`
+2. Sign in with your Google Workspace admin account
+3. Click **Security** → **Access and data control** → **API controls**
+4. Scroll down to **Domain-wide delegation** → click **Manage domain-wide delegation**
+5. Click **Add new**
+6. Client ID: paste the Unique ID you copied in Step 1.4
+7. OAuth scopes: `https://www.googleapis.com/auth/gmail.send`
+8. Click **Authorize**
+
+> **What you just did:** You told Google Workspace that Clark's service account
+> is authorized to send email on behalf of users in your domain, but only to send —
+> not to read, delete, or do anything else.
+
+---
+
+**Step 1.6 — Save the Service Account JSON Somewhere Safe**
+
+Before moving on, make sure you know where the JSON key file is on your computer.
+You'll need it in Phase 3 when you configure the AWS App Runner environment.
+
+A safe place: a folder called `willcrest-secrets` in a location that is NOT
+inside this GitHub repository folder. Do not put it in the `Test` folder.
+
+---
+
+## Phase 2 — Deploy to AWS App Runner
+### Time: ~1.5 hours | Who: You (with Claude guiding) | Where: AWS + Claude Code
+
+---
+
+**Step 2.1 — Add a Dockerfile to the Repository**
+
+A Dockerfile is a recipe that tells AWS how to build and run the application.
+Claude has already created this file in the repository. You don't need to edit it.
+
+---
+
+**Step 2.2 — Create the App Runner Service**
+
+1. Log in to `console.aws.amazon.com`
+2. In the search bar, type **App Runner** and click the result
+3. Click **Create service**
+4. Source: choose **Source code repository**
+5. Click **Add new** next to the GitHub connection
+   - Authorize AWS to access your GitHub account
+   - Select the `WillcrestPartners/Test` repository
+   - Branch: `main` (we'll merge our branch before this step)
+6. **Build settings:**
+   - Configuration file: choose **Use a configuration file** (it will find the
+     `apprunner.yaml` file Claude created)
+7. Click **Next**
+8. Service name: `clark-email-tool`
+9. **Environment variables** — click "Add environment variable" for each of these:
+
+   | Key | Value |
+   |-----|-------|
+   | `SENDER_EMAIL` | `clark@willcrestpartners.com` |
+   | `GOOGLE_SERVICE_ACCOUNT_JSON` | *paste the entire contents of your JSON key file here* |
+   | `DEFAULT_DAILY_LIMIT` | `20` |
+
+   > **How to paste the JSON:** Open the key file in a text editor (Notepad on
+   > Windows, TextEdit on Mac). Select all, copy. Paste it as the value for
+   > `GOOGLE_SERVICE_ACCOUNT_JSON`. It will look like a long block of text
+   > starting with `{` and ending with `}`.
+
+   > **Security note:** AWS stores these as encrypted environment variables.
+   > They are never visible in your GitHub repository. This is the safe way to
+   > store secrets on a server.
+
+10. Port: `8080`
+11. Click **Next** → **Create and deploy**
+12. Wait 3–5 minutes for the first deployment to complete (status changes to "Running")
+13. Copy the **Default domain** shown — it looks like:
+    `https://xxxxxxxxxx.us-east-1.awsapprunner.com`
+    This is your MCP server's address.
+
+---
+
+**Step 2.3 — Create Your config.json on the Server**
+
+The `config.json` file stores your team's access list. It is not in GitHub
+(protected by `.gitignore`) so it must be set as an environment variable on the server.
+
+1. Open `email_tool/config.json.example` in this repository
+2. Make a copy of it and fill in your team's real email addresses and names
+3. In AWS App Runner, add one more environment variable:
+
+   | Key | Value |
+   |-----|-------|
+   | `APP_CONFIG_JSON` | *paste the entire contents of your filled-in config here* |
+
+4. Click **Deploy** to redeploy with the new variable
+
+> Claude will guide you through this step interactively when you reach it.
+
+---
+
+## Phase 3 — Connect Clark to the Email Tool
+### Time: ~20 minutes | Who: You | Where: Claude Cowork project settings
+
+---
+
+**Step 3.1 — Add the MCP Server to Your Cowork Project**
+
+1. Open the Claude Cowork project where Clark lives
+2. Go to **Project Settings** (gear icon or settings menu)
+3. Find the section for **Integrations** or **MCP Servers** or **Tools**
+   (the exact label depends on your Cowork version)
+4. Click **Add MCP Server**
+5. Name: `Clark Email Tool`
+6. URL: paste your App Runner URL from Step 2.2, plus `/mcp` at the end:
+   `https://xxxxxxxxxx.us-east-1.awsapprunner.com/mcp`
+7. Save
+
+Clark will now have the email tool available. You can test it by saying:
+"Clark, check my email access" — Clark will call the `check_my_access` tool
+and confirm whether your account is active.
+
+---
+
+## Phase 4 — Testing Checklist
+### Time: ~30 minutes | Who: Everyone
+
+Work through these in order. Don't skip to the next until the current one passes.
+
+- [ ] Admin asks: "Clark, show me the email dashboard" — dashboard displays
+- [ ] Admin sends a test email to themselves — appears in Gmail Sent folder
+- [ ] Non-coding team member asks Clark to send a test email — works
+- [ ] Admin suspends a user in config, that user tries to send — sees clear error
+- [ ] Same user tries again after being re-activated — works again
+- [ ] Send 20 emails in a day (can be quick tests to yourself) — 21st is blocked
+- [ ] Check the audit log — all 21 attempts are recorded, last one shows "limit reached"
+
+---
+
+## Ongoing: How to Make Changes
+
+Once this is running, here is how you make common changes:
+
+**To add a new user:**
+Ask Clark: *"Add sarah@willcrestpartners.com to the email tool with a daily limit of 10."*
+
+**To suspend someone:**
+Ask Clark: *"Suspend email access for john@willcrestpartners.com."*
+
+**To see what's been sent:**
+Ask Clark: *"Show me the email dashboard."*
+
+**To change someone's daily limit:**
+Ask Clark: *"Change the daily limit for sarah to 15."*
+
+**To update the code (e.g., add a feature):**
+Open Claude Code, describe what you want, Claude writes and deploys it.
+
+---
+
+## Full File List (What's in the Repository)
 
 ```
-CLARK EMAIL TOOL — ADMIN DASHBOARD
-====================================
-Sender:       clark@willcrestpartners.com
-Global limit: 20 emails/user/day
-
-AUTHORIZED USERS
-─────────────────────────────────────────────────────────
-User                        Role    Limit  Sent Today  Active
-bforster@willcrest.com      admin   20     3           ✓
-developer@willcrest.com     user    20     1           ✓
-user2@willcrest.com         user    10     0           ✓
-user3@willcrest.com         user    10     0           ✗  (suspended)
-
-RECENT ACTIVITY (last 10)
-─────────────────────────────────────────────────────────
-2026-05-24 14:32  bforster  → john@example.com         ✓ sent
-2026-05-24 11:15  user2     → mary@example.com         ✓ sent
-2026-05-23 16:44  user3     → external@co.com          ✗ FAILED: user suspended
-
-SETTINGS
-─────────────────────────────────────────────────────────
-Confirmation required:  yes
-Recipient restriction:  none
-Sent folder:            yes
+Test/
+├── WORKPLAN.md                    ← this document
+├── Dockerfile                     ← recipe for AWS to build the app
+├── apprunner.yaml                 ← AWS App Runner configuration
+├── Procfile                       ← alternative start instruction
+├── .env.example                   ← template for environment variables
+├── .gitignore                     ← what GitHub will NOT store (secrets, logs)
+└── email_tool/
+    ├── server.py                  ← the MCP server (Clark's "hands")
+    ├── gmail_client.py            ← Gmail API calls
+    ├── access_control.py          ← who can send, daily limits
+    ├── audit_log.py               ← records every attempt
+    ├── config.json.example        ← template for your user list
+    └── requirements.txt           ← Python libraries needed
 ```
 
-This means you never need to edit a config file manually — you can ask Clark to make
-changes and it updates the config on your behalf.
+**Files that exist only on the server (never in GitHub):**
+- `config.json` — your live user access list
+- `audit_log.jsonl` — the running log of all email activity
 
 ---
 
-## Software You Need (Updated)
+## Glossary
 
-| What | Cost | Why You Need It |
-|------|------|-----------------|
-| **Google Cloud Console** (free) | Free | Issues the Service Account credential |
-| **Python 3** | Free | The language the MCP server is written in |
-| **A hosting service** | ~$5–7/month | Keeps the MCP server running 24/7 |
-| **Claude Code** | Already have | For developers |
-| **Claude Cowork/Teams** | Already have | For all 4 users |
-| **GitHub** | Already have | Stores the code |
-
-### Hosting Options (You Need to Choose One)
-
-The MCP server needs to run somewhere that is always on and reachable by Claude.ai.
-Here are your options from simplest to most complex:
-
-| Option | Cost | Complexity | Notes |
-|--------|------|------------|-------|
-| **Railway.app** | ~$5/mo | Very simple | Recommended for getting started. Connects to GitHub, deploys automatically. |
-| **Render.com** | Free–$7/mo | Simple | Free tier spins down when idle (causes slow first connection) |
-| **Google Cloud Run** | Pay per use | Moderate | Integrates naturally with Google APIs; good long-term choice |
-| **A team member's computer** | Free | None | Only works when that computer is on. Not recommended for business use. |
-
-**Recommendation:** Start with Railway. It is the fastest path from zero to running.
-You connect it to your GitHub account, point it at this repo, and it handles the rest.
-When you're comfortable, migrating to Google Cloud Run later is straightforward.
-
-> **Hosting decision needed before Phase 2 coding begins.** See the open question at
-> the bottom of this document.
-
----
-
-## Security Guardrails (Updated)
-
-| Guardrail | Status | Description |
-|-----------|--------|-------------|
-| Credentials never in code | ✓ Built in | Service account key is an environment variable on the server |
-| Minimum permissions | ✓ Built in | `gmail.send` scope only + `gmail.readonly` to write to Sent folder |
-| Per-user access control | ✓ Built in | Each user must be in the authorized list with `active: true` |
-| Daily send limit | ✓ Built in | Per-user configurable, default 20 |
-| Confirmation before send | ✓ Built in | Always shown, always required |
-| Full audit log | ✓ Built in | Every attempt logged with user, recipient, timestamp, result |
-| Admin-only dashboard | ✓ Built in | `show_dashboard` checks that the caller has admin role |
-| No mass email | ✓ Built in | Tool only accepts a single recipient (no CC/BCC lists for now) |
-| Sent folder copy | ✓ Built in | Sent emails appear in Gmail for accountability |
-
----
-
-## The User Config File (Plain English)
-
-The access control lives in a file called `config.json` on the server. It looks like this:
-
-```json
-{
-  "global": {
-    "sender_email": "clark@willcrestpartners.com",
-    "default_daily_limit": 20,
-    "confirmation_required": true,
-    "copy_to_sent_folder": true
-  },
-  "users": {
-    "bforster@willcrest.com": {
-      "name": "Your Name",
-      "role": "admin",
-      "daily_limit": 20,
-      "active": true
-    },
-    "developer@willcrest.com": {
-      "name": "Developer",
-      "role": "user",
-      "daily_limit": 20,
-      "active": true
-    }
-  }
-}
-```
-
-To suspend someone's access, change `"active": false`. To change their limit, change
-the number. You can do this by asking Clark directly in a Cowork project ("suspend
-access for user3") or by editing the file manually on the server.
-
----
-
-## Audit Log (Plain English)
-
-Every email attempt — successful or not — is written to a log file:
-
-```
-{"time": "2026-05-24T14:32:01", "user": "bforster@willcrest.com", "to": "john@example.com", "subject": "Project update", "status": "sent"}
-{"time": "2026-05-24T11:15:44", "user": "user3@willcrest.com", "to": "x@y.com", "subject": "Test", "status": "failed", "reason": "user suspended"}
-```
-
-If someone asks "why didn't my email send?" you can look here for the exact reason.
-
----
-
-## Phase-by-Phase Implementation Plan (Updated)
-
----
-
-### Phase 1 — Hosting & Google Cloud Setup (~1.5 Hours)
-**You and/or your developer do this in a browser.**
-
-**Step 1.1 — Choose and sign up for Railway**
-- Go to `railway.app` and sign up with your GitHub account
-- This links Railway to your GitHub repos
-
-**Step 1.2 — Google Cloud Project + Service Account**
-- Go to `console.cloud.google.com`
-- Create a project called `willcrest-email-tool`
-- Enable the **Gmail API**
-- Create a **Service Account** (not OAuth — this is the change from the original plan)
-  - Name it something like `clark-email-sender`
-  - Download the JSON key file — store it safely, never upload to GitHub
-- In Google Workspace Admin (`admin.google.com`):
-  - Go to Security → API Controls → Domain-wide Delegation
-  - Add the service account with scope: `https://www.googleapis.com/auth/gmail.send`
-  - This is the step that says "this service account is allowed to send as clark@"
-
-**Step 1.3 — Configure the MCP Server's environment variables on Railway**
-- In Railway, add these environment variables (not in code):
-  - `GOOGLE_SERVICE_ACCOUNT_JSON` — paste the entire contents of the key JSON file
-  - `SENDER_EMAIL` — `clark@willcrestpartners.com`
-
----
-
-### Phase 2 — MCP Server Code (~3–4 Hours)
-**Your developer writes this.**
-
-Files to build:
-```
-email_tool/
-├── server.py          ← the MCP server (replaces the old simple script)
-├── gmail_client.py    ← handles Gmail API calls
-├── access_control.py  ← checks user permissions and daily limits
-├── audit_log.py       ← writes every attempt to the log
-├── config.py          ← reads and updates config.json
-├── config.json        ← the user access list (not in GitHub — server only)
-├── requirements.txt   ← updated with MCP library
-└── Procfile           ← tells Railway how to start the server
-```
-
----
-
-### Phase 3 — Connect to Claude Cowork (~30 Minutes)
-**You do this in your Claude Cowork project settings.**
-
-- In your Cowork project, go to Settings → Tools/Integrations
-- Add a new MCP server
-- Enter the URL of your Railway deployment
-- Claude (Clark) will now have access to the email tools
-
----
-
-### Phase 4 — Team Onboarding (~30 Minutes)
-**Each user does a one-time setup.**
-
-Non-coding users need only:
-1. Access to the Claude Cowork project where Clark lives
-2. Their email address added to `config.json` by the admin
-
-That's it. No Python, no credentials, no terminal.
-
----
-
-### Phase 5 — Testing Checklist
-
-- [ ] Admin can see the dashboard
-- [ ] Admin can send a test email (appears in Gmail Sent folder)
-- [ ] Non-coding user can send a test email
-- [ ] Suspended user cannot send (sees clear error)
-- [ ] Daily limit blocks sends after limit is hit
-- [ ] Failed attempts appear in audit log with correct reason
-- [ ] Confirmation preview shows before every send
-
----
-
-## Open Question — Hosting Decision
-
-**Before your developer starts Phase 2, decide:** Railway.app or another option?
-
-Railway is recommended. If you have a strong preference for another platform or are
-already paying for a cloud service, let us know and we can target that instead.
-
----
-
-## Glossary (Additions)
-
-- **MCP Server** — A small always-running program that exposes tools to Claude.
-  Think of it as Clark's "hands" — without it, Clark can talk but can't act.
-- **Service Account** — A Google identity for an application rather than a person.
-  It has a key file (JSON) that the app uses to authenticate.
-- **Domain-wide Delegation** — A Google Workspace setting that says "this service
-  account is allowed to act on behalf of users in this domain."
-- **Environment Variable (on a server)** — Same concept as on your laptop, but stored
-  in Railway's secure settings panel instead of a file on your computer.
-- **Audit Log** — A running record of every action taken, stored as a file. Like a
-  bank statement for your email tool.
-- **Railway / Render** — Hosting platforms that make it simple to run a small web
-  service. They watch your GitHub repo and automatically redeploy when code changes.
+| Term | Plain English |
+|------|---------------|
+| **AWS App Runner** | Amazon's simplest hosting service. You give it your GitHub repo; it handles building, running, and securing your app. |
+| **IAM User** | A limited sub-account inside your main AWS account. Like giving a contractor a keycard that only opens certain doors. |
+| **Billing Alert** | An AWS feature that emails you when costs exceed a threshold. |
+| **MCP Server** | A small program that gives Claude new abilities — in this case, the ability to send email. |
+| **Service Account** | A Google identity for an application rather than a person. Has a key file instead of a password. |
+| **Domain-wide Delegation** | A Google Workspace setting that says "this service account may act on behalf of users in this domain." |
+| **Environment Variable** | A secret stored in a platform's settings panel rather than in code. Never ends up in GitHub. |
+| **Dockerfile** | A recipe file that tells a hosting service how to build and run your application. |
+| **Audit Log** | A permanent record of every action taken. One line per attempt. |
+| **config.json** | Your live user list — who has access, what limits, all settings. |
+| **Vibe coding** | Building software by describing what you want in plain English and letting Claude write the code. You stay in control; Claude handles the technical execution. |
