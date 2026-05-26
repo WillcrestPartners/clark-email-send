@@ -1,3 +1,4 @@
+# Clark Email MCP Server
 FROM python:3.12-slim
 WORKDIR /app
 COPY email_tool/requirements.txt .
