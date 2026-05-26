@@ -50,11 +50,13 @@ def send_email(sender: str, to: str, subject: str, body: str, copy_to_sent: bool
     sent = service.users().messages().send(userId="me", body=payload).execute()
 
     if copy_to_sent:
-        # Gmail API sends do not automatically appear in Sent — we add the label manually
-        service.users().messages().modify(
-            userId="me",
-            id=sent["id"],
-            body={"addLabelIds": ["SENT"]},
-        ).execute()
+        try:
+            service.users().messages().modify(
+                userId="me",
+                id=sent["id"],
+                body={"addLabelIds": ["SENT"]},
+            ).execute()
+        except Exception:
+            pass  # copy-to-sent is best-effort; send already succeeded
 
     return sent["id"]
