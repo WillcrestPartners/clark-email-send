@@ -75,10 +75,11 @@ def send_email(
 
     try:
         copy_to_sent = access_control._load_config()["global"].get("copy_to_sent_folder", True)
-        message_id = gmail_client.send_email(SENDER, to, subject, body, copy_to_sent)
+        message_id, sent_folder_copied = gmail_client.send_email(SENDER, to, subject, body, copy_to_sent)
         access_control.record_send(caller_email)
         audit_log.log_attempt(caller_email, to, subject, "sent", message_id=message_id)
-        return f"Email sent successfully to {to}."
+        note = "" if sent_folder_copied else " (note: could not copy to clark's Sent folder)"
+        return f"Email sent successfully to {to}.{note}"
     except Exception as e:
         audit_log.log_attempt(caller_email, to, subject, "failed", reason=str(e))
         return f"Failed to send email: {e}"
