@@ -1,10 +1,11 @@
 """
 Clark Email MCP Server
 
-Exposes three tools to Claude:
+Exposes four tools to Claude:
   - send_email        - compose and send an email (with confirmation gate)
   - show_dashboard    - admin-only view of users, limits, and recent activity
   - check_my_access   - any user can see their own access status
+  - run_diagnostics   - full health check: credentials, scopes, access, limits
 
 To run locally:
     cd email_tool && python server.py
@@ -18,6 +19,7 @@ from dotenv import load_dotenv
 
 import access_control
 import audit_log
+import diagnostics
 import gmail_client
 
 load_dotenv()
@@ -131,6 +133,21 @@ def show_dashboard(caller_email: str) -> str:
         )
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+def run_diagnostics(caller_email: str) -> str:
+    """
+    Run a full diagnostic check on the Clark Email Tool.
+
+    Tests server health (credentials, Gmail scopes, mailbox access) and
+    caller status (authorization, account active, daily limit, guardrails).
+    Available to all callers — no authorization required to run diagnostics.
+
+    Args:
+        caller_email: Your email address (used to check your specific access and limits).
+    """
+    return diagnostics.run_all(caller_email)
 
 
 @mcp.tool()
