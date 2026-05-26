@@ -22,7 +22,11 @@ import gmail_client
 
 load_dotenv()
 
-mcp = FastMCP("Clark Email Tool")
+mcp = FastMCP(
+    "Clark Email Tool",
+    host="0.0.0.0",
+    port=int(os.environ.get("PORT", 8080)),
+)
 
 SENDER = os.environ.get("SENDER_EMAIL", "clark@willcrestpartners.com")
 
@@ -150,5 +154,4 @@ def check_my_access(caller_email: str) -> str:
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    mcp.run(transport="streamable-http")
