@@ -154,4 +154,21 @@ def check_my_access(caller_email: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import Response
+    from starlette.routing import Route, Mount
+
+    port = int(os.environ.get("PORT", 8080))
+
+    async def health(request: Request) -> Response:
+        return Response("OK", status_code=200)
+
+    mcp_app = mcp.streamable_http_app()
+    app = Starlette(routes=[
+        Route("/health", health, methods=["GET"]),
+        Mount("/", mcp_app),
+    ])
+
+    uvicorn.run(app, host="0.0.0.0", port=port)
