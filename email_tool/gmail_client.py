@@ -52,6 +52,7 @@ def send_email(sender: str, to: str, subject: str, body: str, copy_to_sent: bool
 
     sent = service.users().messages().send(userId="me", body=payload).execute()
 
+    sent_folder_copied = False
     if copy_to_sent:
         try:
             service.users().messages().modify(
@@ -59,7 +60,8 @@ def send_email(sender: str, to: str, subject: str, body: str, copy_to_sent: bool
                 id=sent["id"],
                 body={"addLabelIds": ["SENT"]},
             ).execute()
+            sent_folder_copied = True
         except Exception:
             pass  # copy-to-sent is best-effort; send already succeeded
 
-    return sent["id"]
+    return sent["id"], sent_folder_copied
