@@ -1,10 +1,11 @@
 """
-Writes a record of every email attempt to audit_log.jsonl.
-Every line is a JSON object — one per attempt, success or failure.
+Records every email attempt to stdout (captured by AWS CloudWatch Logs)
+and optionally to a local file for development use.
 """
 
 import datetime
 import json
+import sys
 from pathlib import Path
 
 LOG_PATH = Path(__file__).parent / "audit_log.jsonl"
@@ -30,12 +31,18 @@ def log_attempt(
     if message_id:
         entry["message_id"] = message_id
 
-    with LOG_PATH.open("a") as f:
-        f.write(json.dumps(entry) + "\n")
+    # Print to stdout — AWS App Runner sends this to CloudWatch Logs automatically
+    print(f"AUDIT: {json.dumps(entry)}", flush=True)
+
+    # Also write to file for local development (file won't persist in App Runner)
+    try:
+        with LOG_PATH.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
 
 
-def get_recent(limit: int = 20) -> list[dict]:
-    """Returns the most recent N log entries, newest first."""
+def get_recent(limit: int = 20) -> list:
     if not LOG_PATH.exists():
         return []
     lines = LOG_PATH.read_text().strip().splitlines()

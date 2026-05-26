@@ -1,36 +1,57 @@
 """
 Checks whether a user is authorized to send email and enforces daily limits.
-Reads from config.json, which lives on the server and is never in GitHub.
+
+Config is loaded from the APP_CONFIG_JSON environment variable in production
+(AWS App Runner). Falls back to config.json file for local development.
+
+Daily send counts are kept in memory — they reset if the server restarts,
+which is acceptable for this use case. Permanent user/settings changes
+require updating APP_CONFIG_JSON in the AWS App Runner console.
 """
 
 import datetime
 import json
+import os
 from pathlib import Path
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
+# In-memory state — resets on restart
+_config_cache = None
+_daily_counts: dict = {}  # { "YYYY-MM-DD": { "email": count } }
+
 
 def _load_config() -> dict:
-    if not CONFIG_PATH.exists():
+    global _config_cache
+    if _config_cache is not None:
+        return _config_cache
+    env_config = os.environ.get("APP_CONFIG_JSON")
+    if env_config:
+        _config_cache = json.loads(env_config)
+    elif CONFIG_PATH.exists():
+        _config_cache = json.loads(CONFIG_PATH.read_text())
+    else:
         raise FileNotFoundError(
-            "config.json not found. Copy config.json.example to config.json "
-            "and fill in your team's details."
+            "No config found. Set APP_CONFIG_JSON as an environment variable "
+            "in AWS App Runner, or create config.json for local development."
         )
-    return json.loads(CONFIG_PATH.read_text())
+    return _config_cache
 
 
 def _save_config(config: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(config, indent=2))
+    global _config_cache
+    _config_cache = config
+    if not os.environ.get("APP_CONFIG_JSON") and CONFIG_PATH.exists():
+        CONFIG_PATH.write_text(json.dumps(config, indent=2))
 
 
 def get_user(email: str) -> dict:
-    """Returns the user config dict, or raises ValueError if not authorized."""
     config = _load_config()
     user = config["users"].get(email)
     if not user:
         raise ValueError(
             f"{email} is not in the authorized user list. "
-            "Ask an admin to add you to config.json."
+            "Ask an admin to add you via the AWS App Runner console."
         )
     if not user.get("active", False):
         raise ValueError(
@@ -40,31 +61,25 @@ def get_user(email: str) -> dict:
 
 
 def check_daily_limit(email: str) -> int:
-    """Returns remaining sends for today. Raises RuntimeError if limit is hit."""
     config = _load_config()
     user = get_user(email)
     limit = user.get("daily_limit", config["global"]["default_daily_limit"])
     today = datetime.date.today().isoformat()
-    counts = config.get("daily_counts", {})
-    sent_today = counts.get(today, {}).get(email, 0)
-
+    sent_today = _daily_counts.get(today, {}).get(email, 0)
     remaining = limit - sent_today
     if remaining <= 0:
         raise RuntimeError(
             f"Daily send limit of {limit} reached for {email}. "
-            "Resets at midnight. An admin can raise your limit in config.json."
+            "Resets at midnight (or on server restart). "
+            "An admin can raise your limit by updating APP_CONFIG_JSON in AWS."
         )
     return remaining
 
 
 def record_send(email: str) -> None:
-    """Increments this user's daily send counter."""
-    config = _load_config()
     today = datetime.date.today().isoformat()
-    counts = config.setdefault("daily_counts", {})
-    day = counts.setdefault(today, {})
-    day[email] = day.get(email, 0) + 1
-    _save_config(config)
+    _daily_counts.setdefault(today, {})
+    _daily_counts[today][email] = _daily_counts[today].get(email, 0) + 1
 
 
 def is_admin(email: str) -> bool:
@@ -74,10 +89,9 @@ def is_admin(email: str) -> bool:
 
 
 def get_dashboard_data() -> dict:
-    """Returns all data needed to render the admin dashboard."""
     config = _load_config()
     today = datetime.date.today().isoformat()
-    today_counts = config.get("daily_counts", {}).get(today, {})
+    today_counts = _daily_counts.get(today, {})
 
     users_summary = []
     for email, user in config["users"].items():
@@ -98,7 +112,6 @@ def get_dashboard_data() -> dict:
 
 
 def update_user(admin_email: str, target_email: str, changes: dict) -> str:
-    """Admin-only: update a user's settings. Returns a confirmation message."""
     if not is_admin(admin_email):
         raise PermissionError(f"{admin_email} does not have admin access.")
     config = _load_config()
@@ -106,11 +119,14 @@ def update_user(admin_email: str, target_email: str, changes: dict) -> str:
         raise ValueError(f"{target_email} is not in the user list.")
     config["users"][target_email].update(changes)
     _save_config(config)
-    return f"Updated {target_email}: {changes}"
+    return (
+        f"Updated {target_email}: {changes}\n"
+        "Note: this change is active until the next server restart. "
+        "To make it permanent, update APP_CONFIG_JSON in AWS App Runner."
+    )
 
 
 def add_user(admin_email: str, new_email: str, name: str, role: str = "user", daily_limit: int = None) -> str:
-    """Admin-only: add a new user."""
     if not is_admin(admin_email):
         raise PermissionError(f"{admin_email} does not have admin access.")
     config = _load_config()
@@ -124,4 +140,7 @@ def add_user(admin_email: str, new_email: str, name: str, role: str = "user", da
         "active": True,
     }
     _save_config(config)
-    return f"Added {new_email} ({name}) as {role} with daily limit {limit}."
+    return (
+        f"Added {new_email} ({name}) as {role} with daily limit {limit}.\n"
+        "Note: to make this permanent, update APP_CONFIG_JSON in AWS App Runner."
+    )
