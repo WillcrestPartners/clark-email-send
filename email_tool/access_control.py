@@ -45,6 +45,12 @@ def _save_config(config: dict) -> None:
         CONFIG_PATH.write_text(json.dumps(config, indent=2))
 
 
+def get_inbound_config() -> dict:
+    """Return the 'inbound' config block, or a disabled default if absent."""
+    config = _load_config()
+    return config.get("inbound", {"enabled": False, "poll_seconds": 300, "mailboxes": []})
+
+
 def get_user(email: str) -> dict:
     config = _load_config()
     user = config["users"].get(email)
