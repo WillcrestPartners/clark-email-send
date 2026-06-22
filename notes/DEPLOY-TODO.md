@@ -5,6 +5,19 @@ only redeploy the ECS service (`clark-email-service`) once. The inbound email
 command bus is live and tested end-to-end as of 2026-06-21; these are tuning /
 polish items, not blockers.
 
+> **⚠️ TOP PRIORITY (next session): debug inbound reply reliability.**
+> The pipeline is live and the happy path works (clean "add a contact" email →
+> reply → one-tap approve → contact created), but replies are **not yet
+> reliable**. A forwarded "add Rich as a contact" email returned no reply
+> (`email_inbound_events.outcome = no_instruction`); a prompt fix shipped
+> (Clark PR #3) but a re-test still produced no reply — root cause unconfirmed.
+> Diagnose with: `email_inbound_events.outcome`, ECS CloudWatch `AUDIT:` lines
+> (`acked`/`ignored`/`dropped`/`no_instruction`), and Vercel function logs for
+> `/api/email/inbound` (check `reply_sent`). Separate the cases: gateway didn't
+> poll/forward → vs Clark agent returned no proposal → vs `/send` reply failed.
+> Suspects: poll timing (still 300s), test email already read, agent extraction
+> on dense forwarded threads, outbound `/send` relay.
+
 How a config change reaches production (learned the hard way):
 1. ECS → **Task definitions → default-clark-email-service → Create new revision**
 2. Expand the **Main** container → **Environment variables** → edit the value
