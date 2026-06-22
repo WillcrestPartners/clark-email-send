@@ -5,6 +5,20 @@
     "confirmation_required": true,
     "copy_to_sent_folder": true
   },
+  "inbound": {
+    "enabled": true,
+    "poll_seconds": 300,
+    "mailboxes": [
+      {
+        "address": "clark@willcrestpartners.com",
+        "destination": {
+          "name": "clark-os",
+          "webhook_url": "",
+          "authorized_senders_url": ""
+        }
+      }
+    ]
+  },
   "users": {
     "admin@yourcompany.com": {
       "name": "Admin Name",

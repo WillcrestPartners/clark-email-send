@@ -19,8 +19,10 @@ from dotenv import load_dotenv
 
 import access_control
 import audit_log
+import clark_client
 import diagnostics
 import gmail_client
+import poller
 
 load_dotenv()
 
@@ -171,30 +173,219 @@ def check_my_access(caller_email: str) -> str:
         return f"Access check failed: {e}"
 
 
+# ── inbound command-bus tools (Phase 1) ─────────────────────────────────────
+
+@mcp.tool()
+def poll_inbox(caller_email: str) -> str:
+    """
+    Admin-only: trigger one inbound poll sweep now and return a summary.
+
+    The gateway normally polls on a timer; this forces an immediate sweep
+    (list unread mail, gate, and route to Clark). Runs NO LLM — gating is
+    deterministic and intent classification happens in Clark.
+
+    Args:
+        caller_email: Must be an admin user.
+    """
+    if not access_control.is_admin(caller_email):
+        return f"Access denied. {caller_email} does not have admin privileges."
+
+    summary = poller.poll_once()
+    lines = [
+        "INBOUND POLL SUMMARY",
+        "-" * 40,
+        f"Mailboxes polled:   {summary['mailboxes']}",
+        f"Messages listed:    {summary['listed']}",
+        f"Acked to Clark:     {summary['acked']}",
+        f"Skipped (seen):     {summary['skipped_seen']}",
+        f"Ignored (sender):   {summary['ignored_sender']}",
+        f"Dropped (hygiene):  {summary['dropped_hygiene']}",
+        f"Failed:             {summary['failed']}",
+        f"Last successful:    {poller.last_successful_poll()}",
+    ]
+    if summary["errors"]:
+        lines.append("Errors:")
+        lines += [f"  - {e}" for e in summary["errors"]]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def verify_sender(caller_email: str, from_email: str) -> str:
+    """
+    Report whether an address is on the cached inbound allow-list.
+
+    Args:
+        caller_email: Your email address.
+        from_email: The address to check against Clark's authorized-sender list.
+    """
+    import gateway_gate
+
+    inbound = access_control.get_inbound_config()
+    secret = os.environ.get("CLARK_INBOUND_HMAC_SECRET", "")
+    senders_url = ""
+    for mb in inbound.get("mailboxes", []):
+        dest = mb.get("destination", {})
+        senders_url = dest.get("authorized_senders_url") or os.environ.get(
+            "CLARK_AUTHORIZED_SENDERS_URL", ""
+        )
+        if senders_url:
+            break
+
+    allowed = clark_client.fetch_authorized_senders(senders_url, secret)
+    ok = gateway_gate.sender_allowed(from_email, allowed)
+    age = clark_client.senders_cache_age()
+    age_str = "never refreshed" if age == float("inf") else f"{int(age)}s ago"
+    status = "AUTHORIZED" if ok else "NOT on the allow-list"
+    return (
+        f"{from_email} is {status}.\n"
+        f"Allow-list size: {len(allowed)} (refreshed {age_str})."
+    )
+
+
+@mcp.tool()
+def send_approval_notification(
+    caller_email: str,
+    to: str,
+    subject: str,
+    body: str,
+    in_reply_to: str = None,
+    references: str = None,
+) -> str:
+    """
+    Admin-only: manually relay a reply from clark@willcrestpartners.com,
+    threaded into the original conversation when In-Reply-To/References given.
+
+    This is a thin wrapper over the same threaded send used by the /send relay.
+
+    Args:
+        caller_email: Must be an admin user.
+        to: Recipient email address.
+        subject: Email subject line.
+        body: Email body text.
+        in_reply_to: Optional Message-ID to set as In-Reply-To (threading).
+        references: Optional References header value (threading).
+    """
+    if not access_control.is_admin(caller_email):
+        return f"Access denied. {caller_email} does not have admin privileges."
+
+    try:
+        copy_to_sent = access_control._load_config()["global"].get("copy_to_sent_folder", True)
+        message_id, copied = gmail_client.send_threaded(
+            SENDER, to, subject, body, in_reply_to, references, copy_to_sent
+        )
+        audit_log.log_attempt(caller_email, to, subject, "sent", message_id=message_id)
+        note = "" if copied else " (note: could not copy to clark's Sent folder)"
+        return f"Reply sent to {to}.{note}"
+    except Exception as e:
+        audit_log.log_attempt(caller_email, to, subject, "failed", reason=str(e))
+        return f"Failed to send reply: {e}"
+
+
 if __name__ == "__main__":
+    import asyncio
+    import json
     import uvicorn
     from contextlib import asynccontextmanager
     from starlette.applications import Starlette
     from starlette.requests import Request
-    from starlette.responses import Response
+    from starlette.responses import JSONResponse, Response
     from starlette.routing import Route, Mount
 
     port = int(os.environ.get("PORT", 8080))
 
     mcp_app = mcp.streamable_http_app()
 
+    async def _poll_loop():
+        """Background task: poll the inbox on a timer while inbound is enabled."""
+        inbound = access_control.get_inbound_config()
+        interval = int(inbound.get("poll_seconds", 300))
+        while True:
+            try:
+                await asyncio.to_thread(poller.poll_once)
+            except Exception as e:  # never let the loop die
+                audit_log.log_attempt("system", "", "", "failed",
+                                      reason=f"poll_loop: {e}")
+            await asyncio.sleep(interval)
+
     @asynccontextmanager
     async def lifespan(app):
+        poll_task = None
+        inbound = access_control.get_inbound_config()
+        if inbound.get("enabled"):
+            poll_task = asyncio.create_task(_poll_loop())
         async with mcp.session_manager.run():
-            yield
+            try:
+                yield
+            finally:
+                if poll_task is not None:
+                    poll_task.cancel()
+                    try:
+                        await poll_task
+                    except asyncio.CancelledError:
+                        pass
 
     async def health(request: Request) -> Response:
-        return Response("OK", status_code=200)
+        inbound = access_control.get_inbound_config()
+        return JSONResponse({
+            "status": "ok",
+            "inbound_enabled": bool(inbound.get("enabled")),
+            "last_successful_poll": poller.last_successful_poll(),
+        })
+
+    async def send_relay(request: Request) -> Response:
+        """Outbound relay: Clark POSTs replies here; we send them threaded.
+
+        Verifies X-Clark-Signature (HMAC-SHA256 over the raw body) using
+        CLARK_INBOUND_HMAC_SECRET, then sends from clark@ with In-Reply-To /
+        References set for threading.
+        """
+        secret = os.environ.get("CLARK_INBOUND_HMAC_SECRET", "")
+        raw = await request.body()
+        signature = request.headers.get("X-Clark-Signature", "")
+        if not secret or not clark_client.verify(raw, secret, signature):
+            return JSONResponse({"error": "invalid signature"}, status_code=401)
+
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+
+        to = payload.get("to")
+        subject = payload.get("subject", "")
+        body = payload.get("body", "")
+        if not to:
+            return JSONResponse({"error": "missing 'to'"}, status_code=400)
+
+        try:
+            copy_to_sent = access_control._load_config()["global"].get(
+                "copy_to_sent_folder", True
+            )
+            message_id, copied = gmail_client.send_threaded(
+                SENDER,
+                to,
+                subject,
+                body,
+                in_reply_to=payload.get("in_reply_to"),
+                references=payload.get("references"),
+                copy_to_sent=copy_to_sent,
+            )
+            audit_log.log_attempt("clark-relay", to, subject, "sent",
+                                  message_id=message_id)
+            return JSONResponse({
+                "status": "sent",
+                "message_id": message_id,
+                "sent_folder_copied": copied,
+                "gateway_message_id": payload.get("gateway_message_id"),
+            })
+        except Exception as e:
+            audit_log.log_attempt("clark-relay", to, subject, "failed", reason=str(e))
+            return JSONResponse({"error": str(e)}, status_code=502)
 
     app = Starlette(
         lifespan=lifespan,
         routes=[
             Route("/health", health, methods=["GET"]),
+            Route("/send", send_relay, methods=["POST"]),
             Mount("/", mcp_app),
         ],
     )

@@ -9,6 +9,7 @@ import os
 
 SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
 
 # ── formatters ────────────────────────────────────────────────────────────────
@@ -177,6 +178,44 @@ def t_gmail_modify_scope():
         return _err("Gmail modify scope", err)
 
 
+def t_gmail_readonly_scope():
+    info = _get_sa_info()
+    if info is None:
+        return _skip("Gmail readonly scope", "service account JSON not available")
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=[READONLY_SCOPE]
+        ).with_subject(_get_sender())
+        service = build("gmail", "v1", credentials=creds)
+        # A real list call confirms the readonly scope is granted end-to-end.
+        service.users().messages().list(userId="me", maxResults=1).execute()
+        return _ok("Gmail readonly scope", "authorized — inbound polling can read mail")
+    except Exception as e:
+        err = str(e)
+        if "invalid_grant" in err:
+            return _err("Gmail readonly scope", "invalid_grant — check domain-wide delegation")
+        if "unauthorized_client" in err or "403" in err or "scope" in err.lower():
+            return _err("Gmail readonly scope", "add gmail.readonly to Domain-wide Delegation in Workspace Admin")
+        return _err("Gmail readonly scope", err)
+
+
+def t_inbound_status():
+    import access_control
+    import poller
+    inbound = access_control.get_inbound_config() if hasattr(access_control, "get_inbound_config") else {}
+    if not inbound.get("enabled"):
+        return _info("Inbound command bus", "disabled (no poll loop running)")
+    mailboxes = ", ".join(mb.get("address", "?") for mb in inbound.get("mailboxes", [])) or "none"
+    last = poller.last_successful_poll() or "never"
+    return _info(
+        "Inbound command bus",
+        f"enabled, poll_seconds={inbound.get('poll_seconds', 300)}, "
+        f"mailboxes=[{mailboxes}], last_successful_poll={last}"
+    )
+
+
 def t_sender_mailbox():
     info = _get_sa_info()
     sender = _get_sender()
@@ -287,7 +326,9 @@ def run_all(caller_email: str) -> str:
         t_google_creds,
         t_gmail_send_scope,
         t_gmail_modify_scope,
+        t_gmail_readonly_scope,
         t_sender_mailbox,
+        t_inbound_status,
     ]
 
     server_lines = []

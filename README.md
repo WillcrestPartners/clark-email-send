@@ -14,6 +14,72 @@ Clark exposes three tools to Claude:
 
 ---
 
+## Inbound (email command bus)
+
+In addition to sending, Clark can act as the **inbound gateway** of an email→AI
+command bus (Phase 1). It polls clark@willcrestpartners.com, applies deterministic
+gating, and forwards qualifying messages to the **Clark** destination, which does
+the intent classification. **This gateway runs NO LLM and holds NO Anthropic key**
+— it is a low-privilege transport that does gating + relay only. (See Clark's
+`specs/email-gateway-integration.md` for the destination side.)
+
+**New Gmail scope:** `https://www.googleapis.com/auth/gmail.readonly` must be added
+to the service account's Domain-wide Delegation in Google Workspace Admin (alongside
+the existing `gmail.send` / `gmail.modify`) so the poller can read mail.
+
+**Poll loop:** when `inbound.enabled` is true, a background asyncio task runs every
+`inbound.poll_seconds` (default 300). Each sweep lists unread inbox mail and, per
+message: dedupes by RFC822 Message-ID (SQLite), drops unknown senders (allow-list
+fetched from Clark, cached 300s) and unhealthy mail (auto-replies, bulk/list mail,
+bounces, self-loops — all deterministic), then POSTs an **envelope v1** to Clark's
+inbound webhook with an `X-Clark-Signature: sha256=<hmac>` header over the raw body.
+On a 2xx ack the message is marked read; otherwise it is left unread for retry.
+
+**Outbound `/send` relay:** Clark POSTs replies back to `POST {gateway}/send` with the
+same HMAC signature. The gateway verifies it and sends from clark@ **threaded**
+(In-Reply-To / References from the payload). Returns 200 on send, 401 on bad
+signature, 5xx on send failure.
+
+**New MCP tools:**
+
+| Tool | Who | What |
+|---|---|---|
+| `poll_inbox` | Admins | Trigger one poll sweep now and return a summary. |
+| `verify_sender` | Any user | Report whether an address is on the cached allow-list. |
+| `send_approval_notification` | Admins | Manually relay a (threaded) reply from clark@. |
+
+`/health` now returns JSON including `inbound_enabled` and `last_successful_poll`.
+
+**New environment variables** (see `.env.example`):
+
+| Variable | Purpose |
+|---|---|
+| `CLARK_INBOUND_HMAC_SECRET` | Shared HMAC secret; signs/verifies all bus traffic. |
+| `CLARK_WEBHOOK_URL` | Clark inbound webhook (or set per-mailbox in config). |
+| `CLARK_AUTHORIZED_SENDERS_URL` | Clark allow-list endpoint (or per-mailbox in config). |
+| `INBOUND_DB_PATH` | SQLite path for idempotency/audit (default `/app/inbound.db`). |
+
+**New config block** (`inbound` in APP_CONFIG_JSON / config.json):
+
+```json
+"inbound": {
+  "enabled": true,
+  "poll_seconds": 300,
+  "mailboxes": [
+    {
+      "address": "clark@willcrestpartners.com",
+      "destination": {
+        "name": "clark-os",
+        "webhook_url": "<or env CLARK_WEBHOOK_URL>",
+        "authorized_senders_url": "<or env CLARK_AUTHORIZED_SENDERS_URL>"
+      }
+    }
+  ]
+}
+```
+
+---
+
 ## System Architecture
 
 ```
@@ -119,5 +185,5 @@ After enabling, they should start a **new conversation** in Claude Cowork to loa
 | Project | `willcrest-clark-email` |
 | Service account | `clark-email-sender@willcrest-clark-email.iam.gserviceaccount.com` |
 | Client ID | `110661416084731877070` |
-| Authorized scopes | `https://www.googleapis.com/auth/gmail.send`, `https://www.googleapis.com/auth/gmail.modify` |
+| Authorized scopes | `https://www.googleapis.com/auth/gmail.send`, `https://www.googleapis.com/auth/gmail.modify`, `https://www.googleapis.com/auth/gmail.readonly` |
 | Delegation authorized in | Google Workspace Admin → Security → API Controls → Domain-wide Delegation |
