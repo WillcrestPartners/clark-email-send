@@ -24,16 +24,6 @@ Parameters:
   SenderEmail:
     Type: String
     Default: clark@willcrestpartners.com
-  PollerEnabled:
-    Type: String
-    AllowedValues: ["true", "false"]
-    Default: "false"
-    Description: Whether the inbound poll schedule is enabled. Deploy with "false"
-      so the Lambda poller does not run alongside the ECS poller; flip to "true"
-      at cutover (and scale the ECS service to 0 first).
-
-Conditions:
-  PollerOn: !Equals [!Ref PollerEnabled, "true"]
 
 Globals:
   Function:
@@ -124,7 +114,10 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: rate(1 minute)
-            Enabled: !If [PollerOn, true, false]
+            # Always enabled post-cutover (the ECS gateway is retired). To pause
+            # inbound polling for maintenance, disable the generated EventBridge
+            # rule directly: aws events disable-rule --name <PollFunctionTick rule>.
+            Enabled: true
 
 Outputs:
   WebFunctionUrl:
