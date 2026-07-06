@@ -4,10 +4,10 @@ google-auth-httplib2==0.2.0
 google-api-python-client==2.127.0
 python-dotenv==1.0.1
 # Web stack: pulled in transitively by mcp[cli], pinned here so the Lambda zip
-# is reproducible. mangum adapts the Starlette ASGI app to the Lambda runtime.
+# is reproducible. uvicorn serves the ASGI app under the Lambda Web Adapter
+# (see infra/template.yaml + run.sh).
 starlette==0.37.2
 uvicorn==0.30.6
-mangum==0.19.0
 # NOTE: boto3 is used by state_store.py / bootstrap.py but is provided by the
 # Lambda runtime, so it is intentionally NOT bundled in the deployment zip.
 # Add it to a local venv only if you run against DynamoDB locally.

@@ -38,7 +38,6 @@ Conditions:
 Globals:
   Function:
     Runtime: python3.12
-    CodeUri: ../build/
     MemorySize: 512
     Architectures: [x86_64]
     Environment:
@@ -79,10 +78,21 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: clark-email-web
-      Handler: lambda_web.handler
+      # Run the ASGI app as a persistent uvicorn server via the AWS Lambda Web
+      # Adapter (Handler = the run.sh command, invoked by the LWA exec wrapper).
+      # A persistent server runs the Starlette lifespan / MCP session manager
+      # once per execution environment; a per-invocation adapter (Mangum) does
+      # not, and re-entering the MCP session manager fails.
+      Handler: run.sh
+      CodeUri: ../build/
       Timeout: 30
+      Layers:
+        - arn:aws:lambda:us-east-1:753240598075:layer:LambdaAdapterLayerX86:25
       Environment:
         Variables:
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/bootstrap
+          AWS_LWA_INVOKE_MODE: buffered
+          PORT: "8080"
           MCP_STATELESS_HTTP: "true"
       FunctionUrlConfig:
         AuthType: NONE
@@ -97,8 +107,13 @@ Resources:
     Properties:
       FunctionName: clark-email-poller
       Handler: lambda_poll.handler
+      CodeUri: ../build/
       Timeout: 120
-      ReservedConcurrentExecutions: 1
+      # No ReservedConcurrentExecutions: this account's concurrency limit is 10,
+      # and reserving any capacity would drop unreserved below AWS's minimum of
+      # 10. Overlapping sweeps are harmless anyway — dedup is idempotent
+      # (DynamoDB rfc822-index + Gmail mark_read), and a sweep finishes well
+      # under the 60s schedule.
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Ref SecretsArn
