@@ -64,7 +64,7 @@ signature, 5xx on send failure.
 | `GATEWAY_TABLE` | DynamoDB table (`clark-email-gateway`) for dedup + daily send counts. When set (prod/Lambda) it replaces SQLite + in-memory state; unset locally. |
 | `GATEWAY_SECRETS_ARN` | Secrets Manager ARN (`clark/email-gateway`); `bootstrap.py` loads its JSON keys into env at cold start. |
 | `MCP_STATELESS_HTTP` | `true` in the Lambda web function (stateless MCP over the Function URL). |
-| `PORT` | Port uvicorn listens on for local/ECS runs (unused under Lambda). |
+| `PORT` | Port uvicorn listens on. `8080` locally/ECS and under Lambda (the LWA forwards Function URL requests to uvicorn on this port). |
 
 **New config block** (`inbound` in APP_CONFIG_JSON / config.json):
 
@@ -101,7 +101,7 @@ Claude Cowork (claude.ai)                Clark (clark.willcrestpartners.com)
         │                                        ▲   │
         │  MCP over HTTPS                envelope │   │ /send reply
         ▼                                (HMAC)   │   ▼  (HMAC)
-Lambda Function URL ─► clark-email-web (Mangum + Starlette: /mcp /send /health)
+Lambda Function URL ─► clark-email-web (uvicorn + Starlette under LWA: /mcp /send /health)
                                     │
 EventBridge rate(1 min) ─► clark-email-poller (poller.poll_once, concurrency 1)
                                     │
@@ -116,7 +116,7 @@ EventBridge rate(1 min) ─► clark-email-poller (poller.poll_once, concurrency
 
 - **Claude Cowork** — Team members interact with Clark here. The Clark Email Tool connector must be enabled in each user's personal settings at claude.ai.
 - **GitHub** (`WillcrestPartners/clark-email-send`) — Source of truth for all code.
-- **AWS Lambda `clark-email-web`** — The Starlette app (MCP `/mcp` + `/send` relay + `/health`) wrapped with Mangum, exposed via a **Lambda Function URL**. MCP runs stateless (`MCP_STATELESS_HTTP=true`). Handler `lambda_web.handler`.
+- **AWS Lambda `clark-email-web`** — The Starlette app (MCP `/mcp` + `/send` relay + `/health`) run as a persistent **uvicorn** server (`python -m uvicorn lambda_web:app`) under the **AWS Lambda Web Adapter (LWA)**, exposed via a **Lambda Function URL**. MCP runs stateless (`MCP_STATELESS_HTTP=true`). The handler is `run.sh`; LWA is enabled via the adapter layer (`AWS_LAMBDA_EXEC_WRAPPER=/opt/bootstrap`, `AWS_LWA_INVOKE_MODE=buffered`, `PORT=8080`). Mangum was dropped because it re-runs the ASGI lifespan per invocation and re-enters the MCP `StreamableHTTPSessionManager` (only enterable once), which broke every route after the first request.
 - **AWS Lambda `clark-email-poller`** — Runs `poller.poll_once()` once per invocation, fired by an **EventBridge schedule** (`rate(1 minute)`), reserved concurrency 1. Handler `lambda_poll.handler`. The schedule is gated by the `PollerEnabled` CloudFormation parameter (deploy `false`, flip to `true` at cutover).
 - **DynamoDB `clark-email-gateway`** (PK `pk`, GSI `rfc822-index`, TTL `ttl`) — Inbound Message-ID dedup (replaces SQLite) and per-user daily send counts (replaces in-memory). Selected automatically when `GATEWAY_TABLE` is set; local dev leaves it unset and keeps SQLite + in-memory.
 - **AWS Secrets Manager `clark/email-gateway`** — JSON with `GOOGLE_SERVICE_ACCOUNT_JSON`, `CLARK_INBOUND_HMAC_SECRET`, `APP_CONFIG_JSON`, referenced by `GATEWAY_SECRETS_ARN`; `bootstrap.py` loads them into env at cold start. The HMAC value equals Clark's `clark/app` `CLARK_INBOUND_HMAC_SECRET` so signatures match.
