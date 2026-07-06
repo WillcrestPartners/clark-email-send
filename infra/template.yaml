@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Clark email gateway on Lambda. Replaces the always-on ECS Fargate service
+  with two functions built from one artifact:
+    - WebFunction  : MCP (/mcp), the /send relay and /health, behind a
+                     Function URL (HTTPS). MCP runs stateless.
+    - PollFunction : one inbound poll sweep, driven by an EventBridge schedule
+                     (~60s), replacing the in-process asyncio poll loop.
+  Inbound-message dedup and daily send counts live in one DynamoDB table.
+  Secrets (Google SA key, HMAC secret, app config) come from Secrets Manager.
+  The gateway<->Clark HMAC contract is unchanged.
+
+Parameters:
+  SecretsArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret holding GOOGLE_SERVICE_ACCOUNT_JSON,
+      CLARK_INBOUND_HMAC_SECRET and APP_CONFIG_JSON (JSON keys).
+  ClarkBaseUrl:
+    Type: String
+    Default: https://clark.willcrestpartners.com
+    Description: Base URL of the Clark app. Inbound-webhook and authorized-senders
+      URLs are derived from it.
+  SenderEmail:
+    Type: String
+    Default: clark@willcrestpartners.com
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 512
+    Architectures: [x86_64]
+    Environment:
+      Variables:
+        GATEWAY_SECRETS_ARN: !Ref SecretsArn
+        GATEWAY_TABLE: !Ref GatewayTable
+        SENDER_EMAIL: !Ref SenderEmail
+        CLARK_WEBHOOK_URL: !Sub "${ClarkBaseUrl}/api/email/inbound"
+        CLARK_AUTHORIZED_SENDERS_URL: !Sub "${ClarkBaseUrl}/api/email/authorized-senders"
+        AUDIT_LOG_PATH: /tmp/audit_log.jsonl
+
+Resources:
+  GatewayTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: clark-email-gateway
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: rfc822_message_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: rfc822-index
+          KeySchema:
+            - AttributeName: rfc822_message_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: KEYS_ONLY
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  WebFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: clark-email-web
+      # Run the ASGI app as a persistent uvicorn server via the AWS Lambda Web
+      # Adapter (Handler = the run.sh command, invoked by the LWA exec wrapper).
+      # A persistent server runs the Starlette lifespan / MCP session manager
+      # once per execution environment; a per-invocation adapter (Mangum) does
+      # not, and re-entering the MCP session manager fails.
+      Handler: run.sh
+      CodeUri: ../build/
+      Timeout: 30
+      Layers:
+        - arn:aws:lambda:us-east-1:753240598075:layer:LambdaAdapterLayerX86:25
+      Environment:
+        Variables:
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/bootstrap
+          AWS_LWA_INVOKE_MODE: buffered
+          PORT: "8080"
+          MCP_STATELESS_HTTP: "true"
+      FunctionUrlConfig:
+        AuthType: NONE
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref SecretsArn
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GatewayTable
+
+  PollFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: clark-email-poller
+      Handler: lambda_poll.handler
+      CodeUri: ../build/
+      Timeout: 120
+      # No ReservedConcurrentExecutions: this account's concurrency limit is 10,
+      # and reserving any capacity would drop unreserved below AWS's minimum of
+      # 10. Overlapping sweeps are harmless anyway — dedup is idempotent
+      # (DynamoDB rfc822-index + Gmail mark_read), and a sweep finishes well
+      # under the 60s schedule.
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref SecretsArn
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GatewayTable
+      Events:
+        Tick:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            # Always enabled post-cutover (the ECS gateway is retired). To pause
+            # inbound polling for maintenance, disable the generated EventBridge
+            # rule directly: aws events disable-rule --name <PollFunctionTick rule>.
+            Enabled: true
+
+Outputs:
+  WebFunctionUrl:
+    Description: HTTPS base URL. Clark's EMAIL_GATEWAY_SEND_URL -> <url>send,
+      Cowork MCP connector -> <url>mcp
+    Value: !GetAtt WebFunctionUrl.FunctionUrl
+  TableName:
+    Value: !Ref GatewayTable
+  PollFunctionName:
+    Value: !Ref PollFunction

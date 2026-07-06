@@ -10,7 +10,9 @@ Exposes four tools to Claude:
 To run locally:
     cd email_tool && python server.py
 
-To deploy: push to GitHub; Railway picks it up automatically.
+On Lambda the same tools + Starlette app (server.build_app) are served by
+lambda_web.handler; inbound polling runs in lambda_poll.handler. See
+infra/template.yaml and notes/DEPLOY-LAMBDA.md.
 """
 
 import os
@@ -26,10 +28,23 @@ import poller
 
 load_dotenv()
 
+
+def _stateless_http() -> bool:
+    """Whether to run MCP in stateless HTTP mode (required on Lambda).
+
+    On Lambda each invocation is independent, so MCP session state cannot be
+    kept in memory between requests. MCP_STATELESS_HTTP=true makes every
+    request self-contained. Local/long-running deploys leave it unset for the
+    default stateful streamable-HTTP behaviour.
+    """
+    return os.environ.get("MCP_STATELESS_HTTP", "").strip().lower() in ("1", "true", "yes")
+
+
 mcp = FastMCP(
     "Clark Email Tool",
     host="0.0.0.0",
     port=int(os.environ.get("PORT", 8080)),
+    stateless_http=_stateless_http(),
 )
 
 SENDER = os.environ.get("SENDER_EMAIL", "clark@willcrestpartners.com")
@@ -281,18 +296,24 @@ def send_approval_notification(
         return f"Failed to send reply: {e}"
 
 
-if __name__ == "__main__":
-    import asyncio
-    import json
-    import uvicorn
-    from contextlib import asynccontextmanager
-    from starlette.applications import Starlette
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse, Response
-    from starlette.routing import Route, Mount
+# ── ASGI app factory (shared by the local server and the Lambda web handler) ─
 
-    port = int(os.environ.get("PORT", 8080))
+import asyncio
+import json
+from contextlib import asynccontextmanager
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route, Mount
 
+
+def build_app(run_poller: bool = True) -> Starlette:
+    """Construct the Starlette ASGI app: MCP mount + /health + /send.
+
+    run_poller controls the in-process background poll loop. It is True for
+    the always-on local/server deploy and False on Lambda, where an external
+    EventBridge schedule drives poller.poll_once() via lambda_poll.handler.
+    """
     mcp_app = mcp.streamable_http_app()
 
     async def _poll_loop():
@@ -311,7 +332,7 @@ if __name__ == "__main__":
     async def lifespan(app):
         poll_task = None
         inbound = access_control.get_inbound_config()
-        if inbound.get("enabled"):
+        if run_poller and inbound.get("enabled"):
             poll_task = asyncio.create_task(_poll_loop())
         async with mcp.session_manager.run():
             try:
@@ -390,4 +411,11 @@ if __name__ == "__main__":
         ],
     )
 
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    return app
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(build_app(run_poller=True), host="0.0.0.0", port=port)

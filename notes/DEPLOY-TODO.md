@@ -1,5 +1,15 @@
 # Email command bus — pending deploy changes
 
+> **⚠️ MIGRATION: ECS → Lambda.** The gateway is moving from the always-on ECS
+> Fargate service (`clark-email-service`) to two AWS Lambda functions
+> (`clark-email-web` behind a Function URL + `clark-email-poller` on an
+> EventBridge schedule), defined by the SAM template in `infra/template.yaml`.
+> State moved to DynamoDB (`clark-email-gateway`) and secrets to Secrets Manager
+> (`clark/email-gateway`). **See the runbook `notes/DEPLOY-LAMBDA.md`.** The ECS
+> console runbook below (Task definitions steps, and the "Reference (current live
+> config)" section) is **superseded by the SAM template** — kept for history, not
+> for new deploys.
+
 Running list of changes to apply in **one batched maintenance window** so we
 only redeploy the ECS service (`clark-email-service`) once. The inbound email
 command bus is live and tested end-to-end as of 2026-06-21; these are tuning /
@@ -18,7 +28,10 @@ polish items, not blockers.
 > Suspects: poll timing (still 300s), test email already read, agent extraction
 > on dense forwarded threads, outbound `/send` relay.
 
-How a config change reaches production (learned the hard way):
+How a config change reaches production (learned the hard way) —
+**⚠️ LEGACY / superseded by the SAM template (`infra/template.yaml`); kept for
+history. Config now lives in Secrets Manager `clark/email-gateway`; deploy via
+`notes/DEPLOY-LAMBDA.md`:**
 1. ECS → **Task definitions → default-clark-email-service → Create new revision**
 2. Expand the **Main** container → **Environment variables** → edit the value
 3. **Verify the edit stuck** before creating (copy the value back out / re-open it)
@@ -29,11 +42,13 @@ How a config change reaches production (learned the hard way):
 
 ---
 
-## 1. Reduce inbound latency: `poll_seconds` 300 → 60  (Option A)
+## ✅ DONE (folded into Lambda migration) — 1. Reduce inbound latency: `poll_seconds` 300 → 60  (Option A)
 
-In `APP_CONFIG_JSON`, change the `inbound` block's `poll_seconds` from `300`
-to `60`. Cuts worst-case email→reply latency from ~5 min to ~1 min. Negligible
-cost (Gmail API quota is generous; service already runs 24/7).
+Folded into the Lambda migration. `poll_seconds:60` now lives in `APP_CONFIG_JSON`
+inside the Secrets Manager secret `clark/email-gateway`, but the actual cadence is
+driven by the EventBridge schedule `rate(1 minute)` firing `clark-email-poller`
+(the old asyncio poll loop is gone). Cuts worst-case email→reply latency from
+~5 min to ~1 min. Negligible cost.
 
 Full value to paste (only `poll_seconds` changed vs. what's live):
 
@@ -43,7 +58,7 @@ Full value to paste (only `poll_seconds` changed vs. what's live):
 
 ---
 
-## 2. Speed up ECS deployments (target group settings — EC2 console)
+## 2. Speed up ECS deployments (target group settings — EC2 console)  — ⚠️ LEGACY (superseded by Lambda; no ELB/target group in the SAM stack)
 
 Deploys currently take ~10 min, mostly load-balancer wait. In **EC2 → Target
 Groups** (the group fronting `clark-email-service`):
@@ -74,7 +89,7 @@ case Express re-applies its defaults.
 
 ---
 
-## Reference (current live config)
+## Reference (current live config)  — ⚠️ LEGACY (pre-Lambda; kept for history)
 
 - Gateway (ECS Fargate): service `clark-email-service`, cluster `default`,
   us-east-1. Image `626928146978.dkr.ecr.us-east-1.amazonaws.com/willcrestpartners/clark-email-send:latest`.
