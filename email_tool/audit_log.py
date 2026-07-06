@@ -5,10 +5,15 @@ and optionally to a local file for development use.
 
 import datetime
 import json
+import os
 import sys
 from pathlib import Path
 
-LOG_PATH = Path(__file__).parent / "audit_log.jsonl"
+# Every audit line also goes to stdout -> CloudWatch, which is the durable
+# record on Lambda. The local file is a convenience for the dashboard's
+# "recent activity"; on Lambda point AUDIT_LOG_PATH at /tmp (the only writable
+# dir) — it survives within a warm container but not across cold starts.
+LOG_PATH = Path(os.environ.get("AUDIT_LOG_PATH", str(Path(__file__).parent / "audit_log.jsonl")))
 
 
 def log_attempt(

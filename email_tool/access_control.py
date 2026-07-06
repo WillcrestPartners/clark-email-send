@@ -14,6 +14,8 @@ import json
 import os
 from pathlib import Path
 
+import state_store
+
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 # In-memory state — resets on restart
@@ -71,7 +73,10 @@ def check_daily_limit(email: str) -> int:
     user = get_user(email)
     limit = user.get("daily_limit", config["global"]["default_daily_limit"])
     today = datetime.date.today().isoformat()
-    sent_today = _daily_counts.get(today, {}).get(email, 0)
+    if state_store.enabled():
+        sent_today = state_store.get_daily_count(email, today)
+    else:
+        sent_today = _daily_counts.get(today, {}).get(email, 0)
     remaining = limit - sent_today
     if remaining <= 0:
         raise RuntimeError(
@@ -84,6 +89,9 @@ def check_daily_limit(email: str) -> int:
 
 def record_send(email: str) -> None:
     today = datetime.date.today().isoformat()
+    if state_store.enabled():
+        state_store.increment_daily_count(email, today)
+        return
     _daily_counts.setdefault(today, {})
     _daily_counts[today][email] = _daily_counts[today].get(email, 0) + 1
 
@@ -98,16 +106,22 @@ def get_dashboard_data() -> dict:
     config = _load_config()
     today = datetime.date.today().isoformat()
     today_counts = _daily_counts.get(today, {})
+    use_store = state_store.enabled()
 
     users_summary = []
     for email, user in config["users"].items():
         limit = user.get("daily_limit", config["global"]["default_daily_limit"])
+        sent_today = (
+            state_store.get_daily_count(email, today)
+            if use_store
+            else today_counts.get(email, 0)
+        )
         users_summary.append({
             "email": email,
             "name": user.get("name", ""),
             "role": user.get("role", "user"),
             "daily_limit": limit,
-            "sent_today": today_counts.get(email, 0),
+            "sent_today": sent_today,
             "active": user.get("active", False),
         })
 
