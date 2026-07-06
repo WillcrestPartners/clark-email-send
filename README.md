@@ -27,13 +27,16 @@ the intent classification. **This gateway runs NO LLM and holds NO Anthropic key
 to the service account's Domain-wide Delegation in Google Workspace Admin (alongside
 the existing `gmail.send` / `gmail.modify`) so the poller can read mail.
 
-**Poll loop:** when `inbound.enabled` is true, a background asyncio task runs every
-`inbound.poll_seconds` (default 300). Each sweep lists unread inbox mail and, per
-message: dedupes by RFC822 Message-ID (SQLite), drops unknown senders (allow-list
-fetched from Clark, cached 300s) and unhealthy mail (auto-replies, bulk/list mail,
-bounces, self-loops — all deterministic), then POSTs an **envelope v1** to Clark's
-inbound webhook with an `X-Clark-Signature: sha256=<hmac>` header over the raw body.
-On a 2xx ack the message is marked read; otherwise it is left unread for retry.
+**Poll loop:** the poller runs one sweep per invocation via `poller.poll_once()`.
+In production this is the `clark-email-poller` Lambda, fired every minute by an
+EventBridge schedule (`rate(1 minute)`, reserved concurrency 1) — it replaces the
+old always-on asyncio loop. Each sweep lists unread inbox mail and, per message:
+dedupes by RFC822 Message-ID (DynamoDB in prod, SQLite locally), drops unknown
+senders (allow-list fetched from Clark, cached 300s) and unhealthy mail
+(auto-replies, bulk/list mail, bounces, self-loops — all deterministic), then POSTs
+an **envelope v1** to Clark's inbound webhook with an `X-Clark-Signature:
+sha256=<hmac>` header over the raw body. On a 2xx ack the message is marked read;
+otherwise it is left unread for retry.
 
 **Outbound `/send` relay:** Clark POSTs replies back to `POST {gateway}/send` with the
 same HMAC signature. The gateway verifies it and sends from clark@ **threaded**
@@ -55,16 +58,20 @@ signature, 5xx on send failure.
 | Variable | Purpose |
 |---|---|
 | `CLARK_INBOUND_HMAC_SECRET` | Shared HMAC secret; signs/verifies all bus traffic. |
-| `CLARK_WEBHOOK_URL` | Clark inbound webhook (or set per-mailbox in config). |
-| `CLARK_AUTHORIZED_SENDERS_URL` | Clark allow-list endpoint (or per-mailbox in config). |
-| `INBOUND_DB_PATH` | SQLite path for idempotency/audit (default `/app/inbound.db`). |
+| `CLARK_WEBHOOK_URL` | Clark inbound webhook (or set per-mailbox in config). Prod → `https://clark.willcrestpartners.com/api/email/inbound`. |
+| `CLARK_AUTHORIZED_SENDERS_URL` | Clark allow-list endpoint (or per-mailbox in config). Prod → `https://clark.willcrestpartners.com/api/email/authorized-senders`. |
+| `INBOUND_DB_PATH` | SQLite path for idempotency/audit (default `/app/inbound.db`); local dev only. |
+| `GATEWAY_TABLE` | DynamoDB table (`clark-email-gateway`) for dedup + daily send counts. When set (prod/Lambda) it replaces SQLite + in-memory state; unset locally. |
+| `GATEWAY_SECRETS_ARN` | Secrets Manager ARN (`clark/email-gateway`); `bootstrap.py` loads its JSON keys into env at cold start. |
+| `MCP_STATELESS_HTTP` | `true` in the Lambda web function (stateless MCP over the Function URL). |
+| `PORT` | Port uvicorn listens on for local/ECS runs (unused under Lambda). |
 
 **New config block** (`inbound` in APP_CONFIG_JSON / config.json):
 
 ```json
 "inbound": {
   "enabled": true,
-  "poll_seconds": 300,
+  "poll_seconds": 60,
   "mailboxes": [
     {
       "address": "clark@willcrestpartners.com",
@@ -78,33 +85,50 @@ signature, 5xx on send failure.
 }
 ```
 
+In production this block lives in `APP_CONFIG_JSON` inside the Secrets Manager
+secret. `poll_seconds` is retained for local dev; under Lambda the real cadence
+is the EventBridge `rate(1 minute)` schedule on `clark-email-poller`.
+
 ---
 
 ## System Architecture
 
+The gateway runs on **AWS Lambda** (SAM template `infra/template.yaml`): one
+build artifact, two functions.
+
 ```
-Claude Cowork (claude.ai)
-        │
-        │  MCP over HTTPS
-        ▼
-AWS ECS Express  ←──── GitHub Actions (builds & pushes image on every push to main)
-(clark-email-service)        │
-        │                    └── AWS ECR (Docker image registry)
-        │  Gmail API (domain-wide delegation)
-        ▼
-Google Gmail
-(sends as clark@willcrestpartners.com)
+Claude Cowork (claude.ai)                Clark (clark.willcrestpartners.com)
+        │                                        ▲   │
+        │  MCP over HTTPS                envelope │   │ /send reply
+        ▼                                (HMAC)   │   ▼  (HMAC)
+Lambda Function URL ─► clark-email-web (Mangum + Starlette: /mcp /send /health)
+                                    │
+EventBridge rate(1 min) ─► clark-email-poller (poller.poll_once, concurrency 1)
+                                    │
+        DynamoDB clark-email-gateway (dedup + daily counts)
+        Secrets Manager clark/email-gateway (SA key, HMAC, APP_CONFIG_JSON)
+                                    │  Gmail API (domain-wide delegation)
+                                    ▼
+                          Google Gmail (sends as clark@willcrestpartners.com)
 ```
 
 **Component details:**
 
 - **Claude Cowork** — Team members interact with Clark here. The Clark Email Tool connector must be enabled in each user's personal settings at claude.ai.
-- **GitHub** (`WillcrestPartners/clark-email-send`) — Source of truth for all code. Every push to `main` triggers a GitHub Actions build.
-- **GitHub Actions** (`.github/workflows/deploy.yml`) — Builds the Docker image and pushes it to AWS ECR automatically.
-- **AWS ECR** — Stores the Docker image at `626928146978.dkr.ecr.us-east-1.amazonaws.com/willcrestpartners/clark-email-send:latest`.
-- **AWS ECS Express** (`clark-email-service`) — Runs the server container. To deploy a new image, increment the `REDEPLOY` environment variable to force a task replacement.
+- **GitHub** (`WillcrestPartners/clark-email-send`) — Source of truth for all code.
+- **AWS Lambda `clark-email-web`** — The Starlette app (MCP `/mcp` + `/send` relay + `/health`) wrapped with Mangum, exposed via a **Lambda Function URL**. MCP runs stateless (`MCP_STATELESS_HTTP=true`). Handler `lambda_web.handler`.
+- **AWS Lambda `clark-email-poller`** — Runs `poller.poll_once()` once per invocation, fired by an **EventBridge schedule** (`rate(1 minute)`), reserved concurrency 1. Handler `lambda_poll.handler`. The schedule is gated by the `PollerEnabled` CloudFormation parameter (deploy `false`, flip to `true` at cutover).
+- **DynamoDB `clark-email-gateway`** (PK `pk`, GSI `rfc822-index`, TTL `ttl`) — Inbound Message-ID dedup (replaces SQLite) and per-user daily send counts (replaces in-memory). Selected automatically when `GATEWAY_TABLE` is set; local dev leaves it unset and keeps SQLite + in-memory.
+- **AWS Secrets Manager `clark/email-gateway`** — JSON with `GOOGLE_SERVICE_ACCOUNT_JSON`, `CLARK_INBOUND_HMAC_SECRET`, `APP_CONFIG_JSON`, referenced by `GATEWAY_SECRETS_ARN`; `bootstrap.py` loads them into env at cold start. The HMAC value equals Clark's `clark/app` `CLARK_INBOUND_HMAC_SECRET` so signatures match.
+- **AWS SAM** (`infra/template.yaml`) — Defines both functions, the Function URL, the EventBridge rule, the DynamoDB table, and IAM. `ClarkBaseUrl` parameter sets the Clark base URL (prod `https://clark.willcrestpartners.com`); deploy/cutover runbook in `notes/DEPLOY-LAMBDA.md`.
 - **Google Cloud** (`willcrest-clark-email` project) — Hosts the `clark-email-sender` service account with domain-wide delegation enabled.
 - **Google Workspace Admin** — Authorizes the service account client ID (`110661416084731877070`) to impersonate `clark@willcrestpartners.com` with Gmail scopes.
+
+> **Legacy (pre-migration):** the gateway previously ran as a single always-on
+> **AWS ECS Express** service (`clark-email-service`, cluster `default`) built from a
+> Docker image in ECR via GitHub Actions on every push to `main`, doing all three
+> jobs (MCP, `/send`, and the asyncio poll loop) in one container. Superseded by the
+> Lambda architecture above.
 
 ---
 
@@ -112,9 +136,10 @@ Google Gmail
 
 Two things are required:
 
-### 1. Add them to APP_CONFIG_JSON in ECS
+### 1. Add them to APP_CONFIG_JSON
 
-In the AWS ECS console, go to the `clark-email-service` → Update service → Environment variables → edit the `APP_CONFIG_JSON` value. Add an entry to the `users` object:
+Edit the `APP_CONFIG_JSON` value inside the Secrets Manager secret
+`clark/email-gateway` and add an entry to the `users` object:
 
 ```json
 "kristin@willcrest.com": {
@@ -125,15 +150,22 @@ In the AWS ECS console, go to the `clark-email-service` → Update service → E
 }
 ```
 
-Save and increment `REDEPLOY` to apply the change.
+The functions read the secret at cold start, so the change takes effect on the
+next cold start (or force one by redeploying the stack). *(Legacy ECS: this value
+lived in the `clark-email-service` task definition and was applied by incrementing
+`REDEPLOY`.)*
 
 ### 2. Enable the connector in their Claude account
 
-The new user must go to **claude.ai → Settings → Connectors** and enable the **Clark Email Tool** connector for their account. The connector URL is:
+The new user must go to **claude.ai → Settings → Connectors** and enable the **Clark Email Tool** connector for their account. The connector URL is the gateway's `/mcp` path:
 
 ```
-https://cl-874b2f3a18c5475dbfbd921b886e8153.ecs.us-east-1.on.aws/mcp
+https://cl-874b2f3a18c5475dbfbd921b886e8153.ecs.us-east-1.on.aws/mcp   (legacy ECS)
 ```
+
+> **⚠️ Changing at cutover:** after the Lambda migration this becomes the new
+> Lambda **Function URL** + `/mcp` (i.e. `<FunctionUrl>mcp`). Update the Cowork
+> connector to the new URL once the stack is live.
 
 After enabling, they should start a **new conversation** in Claude Cowork to load the tools.
 
@@ -141,15 +173,22 @@ After enabling, they should start a **new conversation** in Claude Cowork to loa
 
 ## Configured Settings
 
-### ECS Environment Variables
+### Environment Variables
+
+Under Lambda, `GOOGLE_SERVICE_ACCOUNT_JSON` and `APP_CONFIG_JSON` come from the
+Secrets Manager secret `clark/email-gateway` (loaded by `bootstrap.py` at cold
+start); non-secret vars (`GATEWAY_TABLE`, `GATEWAY_SECRETS_ARN`, `ClarkBaseUrl`
+→ `CLARK_*`, `MCP_STATELESS_HTTP`) are set by the SAM template.
+
+*Legacy ECS environment variables (superseded):*
 
 | Variable | Value | Notes |
 |---|---|---|
 | `SENDER_EMAIL` | `clark@willcrestpartners.com` | The Gmail address emails are sent from |
 | `PORT` | `8080` | Port the MCP server listens on |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | *(service account key JSON)* | Full JSON key — stored securely in ECS, never in GitHub |
-| `APP_CONFIG_JSON` | *(see below)* | User list and global settings |
-| `REDEPLOY` | `1`, `2`, `3`… | Increment to force a new deployment |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | *(service account key JSON)* | Full JSON key — now in Secrets Manager |
+| `APP_CONFIG_JSON` | *(see below)* | User list and global settings — now in Secrets Manager |
+| `REDEPLOY` | `1`, `2`, `3`… | Increment to force a new ECS deployment |
 
 ### APP_CONFIG_JSON Structure
 
