@@ -19,6 +19,7 @@ poll_once() runs one sweep over every configured mailbox:
 This module holds NO LLM and NO business logic — only gating + transport.
 """
 
+import base64
 import datetime
 import os
 import uuid
@@ -33,6 +34,39 @@ import inbound_store
 
 # Module-level marker the /health route and diagnostics surface.
 LAST_SUCCESSFUL_POLL = None
+
+# Largest attachment (raw bytes) we inline as base64 in the envelope. The Lambda
+# Function URL caps a request at ~6MB and base64 inflates by ~4/3, so 4MB raw
+# (~5.4MB encoded) leaves headroom for the rest of the envelope. Larger CIMs are
+# forwarded as metadata with `too_large: true` (a future S3-staged transport can
+# fill `url` instead). Env-overridable.
+MAX_INLINE_ATTACHMENT_BYTES = int(
+    os.environ.get("MAX_INLINE_ATTACHMENT_BYTES", str(4 * 1024 * 1024))
+)
+
+
+def _build_attachments(msg) -> list:
+    """Build the envelope's `attachments` list: PDF parts only, base64-inlined
+    under the size cap. Non-PDF attachments (logos, etc.) are skipped so the
+    envelope stays lean — Clark's CIM path only acts on PDFs today."""
+    result = []
+    for att in email_parse.extract_attachments(msg):
+        content_type = att["content_type"]
+        filename = att["filename"]
+        is_pdf = "pdf" in content_type or filename.lower().endswith(".pdf")
+        if not is_pdf:
+            continue
+        entry = {
+            "filename": filename,
+            "content_type": content_type,
+            "size_bytes": att["size"],
+        }
+        if att["size"] <= MAX_INLINE_ATTACHMENT_BYTES:
+            entry["content_base64"] = base64.b64encode(att["bytes"]).decode("ascii")
+        else:
+            entry["too_large"] = True
+        result.append(entry)
+    return result
 
 
 def _utc_now_iso() -> str:
@@ -104,6 +138,12 @@ def _process_message(mailbox: str, msg_id: str, dest_name: str, webhook_url: str
         "body_full_text": parsed["body_full_text"],
         "signature_block": parsed["signature_block"],
     }
+
+    # Forward PDF attachments (e.g. a CIM) so Clark can analyze + file them.
+    # Only added when present, so text-only mail keeps the exact prior envelope.
+    attachments = _build_attachments(msg)
+    if attachments:
+        envelope["attachments"] = attachments
 
     # Persist as received -> gated -> routed before POSTing.
     inbound_store.record(
