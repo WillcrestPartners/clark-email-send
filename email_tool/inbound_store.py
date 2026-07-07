@@ -15,7 +15,10 @@ import threading
 
 import state_store
 
-_DEFAULT_DB_PATH = os.environ.get("INBOUND_DB_PATH", "/app/inbound.db")
+# /tmp is the only writable directory on Lambda; the container deploy sets
+# INBOUND_DB_PATH=/app/inbound.db explicitly if it wants the old location.
+# (When GATEWAY_TABLE is set, DynamoDB is used and SQLite is never touched.)
+_DEFAULT_DB_PATH = os.environ.get("INBOUND_DB_PATH", "/tmp/inbound.db")
 _lock = threading.Lock()
 
 
@@ -54,7 +57,58 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # Processing claims: the PRIMARY KEY makes claim_message() atomic, matching
+    # the DynamoDB conditional-put semantics in state_store.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inbound_claims (
+            dedup_key  TEXT PRIMARY KEY,
+            status     TEXT,
+            created_at TEXT
+        )
+        """
+    )
     conn.commit()
+
+
+# ── processing claims (atomic inbound dedup; see state_store docstring) ──────
+
+def claim_message(dedup_key: str) -> bool:
+    """Atomically claim an inbound message. True = we own it; False = already
+    claimed (in-flight or processed)."""
+    if state_store.enabled():
+        return state_store.claim_message(dedup_key)
+    with _lock, _connect() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO inbound_claims (dedup_key, status, created_at) VALUES (?, ?, ?)",
+                (dedup_key, "claimed", _now()),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def confirm_claim(dedup_key: str, status: str = "acked") -> None:
+    """Mark a claim terminal (acked/ignored/dropped)."""
+    if state_store.enabled():
+        return state_store.confirm_claim(dedup_key, status)
+    with _lock, _connect() as conn:
+        conn.execute(
+            "UPDATE inbound_claims SET status = ? WHERE dedup_key = ?",
+            (status, dedup_key),
+        )
+        conn.commit()
+
+
+def release_claim(dedup_key: str) -> None:
+    """Delete a claim after a failed forward so a later sweep retries it."""
+    if state_store.enabled():
+        return state_store.release_claim(dedup_key)
+    with _lock, _connect() as conn:
+        conn.execute("DELETE FROM inbound_claims WHERE dedup_key = ?", (dedup_key,))
+        conn.commit()
 
 
 def already_seen(rfc822_message_id: str) -> bool:

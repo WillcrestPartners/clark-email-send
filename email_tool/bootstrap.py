@@ -16,10 +16,13 @@ import json
 import os
 
 # Keys we lift out of the JSON secret into the process environment.
+# GATEWAY_MCP_TOKEN is optional: when present, /mcp requires it as a bearer
+# token (see server._token_guard); when absent, /mcp stays open as before.
 _SECRET_KEYS = (
     "GOOGLE_SERVICE_ACCOUNT_JSON",
     "CLARK_INBOUND_HMAC_SECRET",
     "APP_CONFIG_JSON",
+    "GATEWAY_MCP_TOKEN",
 )
 
 _loaded = False

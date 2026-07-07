@@ -92,14 +92,23 @@ def send_email(
             f"To cancel, simply do not call it again."
         )
 
+    # Consume the daily limit atomically BEFORE sending (increment-then-check),
+    # so concurrent invocations cannot both slip under the limit. Refund it if
+    # the Gmail send itself fails.
+    try:
+        access_control.consume_daily_limit(caller_email)
+    except (ValueError, RuntimeError) as e:
+        audit_log.log_attempt(caller_email, to, subject, "failed", reason=str(e))
+        return f"Cannot send: {e}"
+
     try:
         copy_to_sent = access_control._load_config()["global"].get("copy_to_sent_folder", True)
         message_id, sent_folder_copied = gmail_client.send_email(SENDER, to, subject, body, copy_to_sent)
-        access_control.record_send(caller_email)
         audit_log.log_attempt(caller_email, to, subject, "sent", message_id=message_id)
         note = "" if sent_folder_copied else " (note: could not copy to clark's Sent folder)"
         return f"Email sent successfully to {to}.{note}"
     except Exception as e:
+        access_control.refund_send(caller_email)
         audit_log.log_attempt(caller_email, to, subject, "failed", reason=str(e))
         return f"Failed to send email: {e}"
 
@@ -299,12 +308,47 @@ def send_approval_notification(
 # ── ASGI app factory (shared by the local server and the Lambda web handler) ─
 
 import asyncio
+import hmac as _hmac
 import json
 from contextlib import asynccontextmanager
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, Mount
+
+
+def _token_guard(app, token: str):
+    """Optional shared-secret gate for the MCP mount.
+
+    The Function URL is public (AuthType NONE) and MCP tools trust a
+    self-asserted caller_email, so URL secrecy is otherwise the only barrier.
+    When GATEWAY_MCP_TOKEN is set (via the clark/email-gateway secret), /mcp
+    requires `Authorization: Bearer <token>` or `X-Clark-Gateway-Token:
+    <token>`; when unset, behavior is unchanged (opt-in so enabling it can be
+    coordinated with the Cowork connector's header config). /send is not
+    gated — it has its own HMAC check.
+    """
+    if not token:
+        return app
+
+    async def guarded(scope, receive, send):
+        if scope["type"] == "http":
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1")
+                       for k, v in scope.get("headers", [])}
+            supplied = headers.get("authorization", "")
+            if supplied.lower().startswith("bearer "):
+                supplied = supplied[7:]
+            else:
+                supplied = headers.get("x-clark-gateway-token", "")
+            if not _hmac.compare_digest(supplied, token):
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body",
+                            "body": b'{"error": "unauthorized"}'})
+                return
+        await app(scope, receive, send)
+
+    return guarded
 
 
 def build_app(run_poller: bool = True) -> Starlette:
@@ -407,7 +451,7 @@ def build_app(run_poller: bool = True) -> Starlette:
         routes=[
             Route("/health", health, methods=["GET"]),
             Route("/send", send_relay, methods=["POST"]),
-            Mount("/", mcp_app),
+            Mount("/", _token_guard(mcp_app, os.environ.get("GATEWAY_MCP_TOKEN", ""))),
         ],
     )
 

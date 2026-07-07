@@ -98,12 +98,14 @@ Resources:
       FunctionName: clark-email-poller
       Handler: lambda_poll.handler
       CodeUri: ../build/
-      Timeout: 120
+      # Timeout below the rate(1 minute) schedule so sweeps can't stack up.
+      # (Typical sweep: <1s; max observed: ~4s.)
+      Timeout: 55
       # No ReservedConcurrentExecutions: this account's concurrency limit is 10,
       # and reserving any capacity would drop unreserved below AWS's minimum of
-      # 10. Overlapping sweeps are harmless anyway — dedup is idempotent
-      # (DynamoDB rfc822-index + Gmail mark_read), and a sweep finishes well
-      # under the 60s schedule.
+      # 10. Overlap protection instead comes from the atomic per-message CLAIM#
+      # rows (DynamoDB conditional put in state_store.claim_message) — at most
+      # one sweep forwards any given message.
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Ref SecretsArn

@@ -36,10 +36,11 @@ def log_attempt(
     if message_id:
         entry["message_id"] = message_id
 
-    # Print to stdout — AWS App Runner sends this to CloudWatch Logs automatically
+    # Print to stdout — Lambda/ECS send this to CloudWatch Logs automatically;
+    # CloudWatch is the durable audit record.
     print(f"AUDIT: {json.dumps(entry)}", flush=True)
 
-    # Also write to file for local development (file won't persist in App Runner)
+    # Also write to file for local development (ephemeral on Lambda)
     try:
         with LOG_PATH.open("a") as f:
             f.write(json.dumps(entry) + "\n")
