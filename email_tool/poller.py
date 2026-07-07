@@ -6,12 +6,15 @@ poll_once() runs one sweep over every configured mailbox:
   2. list unread inbox messages
   3. for each message (defensively, one bad message never kills the loop):
        - fetch raw, parse headers
-       - skip if already seen (idempotency by RFC822 Message-ID)
-       - sender gate: unknown sender -> mark read, skip, NO reply
-       - hygiene gate: drop reason -> mark read, skip
+       - atomically CLAIM it (idempotency by RFC822 Message-ID, falling back
+         to the Gmail message id) — a concurrent/overlapping sweep loses the
+         claim and skips, so a message is never double-forwarded
+       - sender gate: unknown sender -> mark read, confirm claim, NO reply
+       - hygiene gate: drop reason -> mark read, confirm claim
        - else build envelope, persist row, POST to Clark
-       - on 2xx: status=acked + mark the Gmail message read
-       - on failure: increment attempts, leave unread for retry
+       - on 2xx: confirm claim + status=acked + mark the Gmail message read
+       - on failure: RELEASE the claim and leave unread, so a later sweep
+         genuinely retries it
 
 This module holds NO LLM and NO business logic — only gating + transport.
 """
@@ -57,14 +60,19 @@ def _process_message(mailbox: str, msg_id: str, dest_name: str, webhook_url: str
     rfc822_id = parsed.get("rfc822_message_id", "")
     from_email = parsed["from"]["email"]
 
-    # Idempotency.
-    if rfc822_id and inbound_store.already_seen(rfc822_id):
+    # Idempotency: atomically claim the message. Messages without a Message-ID
+    # header fall back to the (mailbox-stable) Gmail message id, so nothing is
+    # exempt from dedup. Losing the claim means another sweep is handling (or
+    # has handled) it.
+    dedup_key = rfc822_id or f"gmail:{mailbox}:{msg_id}"
+    if not inbound_store.claim_message(dedup_key):
         summary["skipped_seen"] += 1
         return
 
     # Sender gate — unknown senders are silently dropped (mark read, no reply).
     if not gateway_gate.sender_allowed(from_email, allowed):
         gmail_client.mark_read(mailbox, msg_id)
+        inbound_store.confirm_claim(dedup_key, "ignored")
         audit_log.log_attempt(from_email, mailbox, parsed.get("subject", ""),
                               "ignored", reason="sender_not_authorized")
         summary["ignored_sender"] += 1
@@ -74,6 +82,7 @@ def _process_message(mailbox: str, msg_id: str, dest_name: str, webhook_url: str
     drop_reason = gateway_gate.hygiene_drop_reason(headers)
     if drop_reason:
         gmail_client.mark_read(mailbox, msg_id)
+        inbound_store.confirm_claim(dedup_key, "dropped")
         audit_log.log_attempt(from_email, mailbox, parsed.get("subject", ""),
                               "dropped", reason=drop_reason)
         summary["dropped_hygiene"] += 1
@@ -114,6 +123,8 @@ def _process_message(mailbox: str, msg_id: str, dest_name: str, webhook_url: str
     try:
         status_code, _resp = clark_client.post_envelope(webhook_url, secret, envelope)
     except Exception as e:
+        # Release the claim so the (still-unread) message retries next sweep.
+        inbound_store.release_claim(dedup_key)
         inbound_store.update_status(gateway_message_id, "send_error", attempts=1)
         audit_log.log_attempt(from_email, mailbox, parsed.get("subject", ""),
                               "failed", reason=f"post_envelope: {e}")
@@ -121,13 +132,15 @@ def _process_message(mailbox: str, msg_id: str, dest_name: str, webhook_url: str
         return
 
     if 200 <= status_code < 300:
+        inbound_store.confirm_claim(dedup_key, "acked")
         inbound_store.update_status(gateway_message_id, "acked", attempts=1)
         gmail_client.mark_read(mailbox, msg_id)
         audit_log.log_attempt(from_email, mailbox, parsed.get("subject", ""),
                               "acked", message_id=gateway_message_id)
         summary["acked"] += 1
     else:
-        # Leave unread for a future retry; record the attempt.
+        # Release the claim and leave unread so a future sweep retries.
+        inbound_store.release_claim(dedup_key)
         inbound_store.update_status(gateway_message_id, "rejected", attempts=1)
         audit_log.log_attempt(from_email, mailbox, parsed.get("subject", ""),
                               "failed", reason=f"clark status {status_code}")
@@ -186,8 +199,23 @@ def poll_once() -> dict:
                                       reason=f"process {msg_id}: {e}")
 
     LAST_SUCCESSFUL_POLL = _utc_now_iso()
+    # On Lambda the poller and the /health web endpoint run in different
+    # containers, so a module global is invisible to /health — persist the
+    # marker in the shared state store too (best-effort).
+    try:
+        import state_store
+        if state_store.enabled():
+            state_store.set_meta("last_successful_poll", LAST_SUCCESSFUL_POLL)
+    except Exception:
+        pass
     return summary
 
 
 def last_successful_poll() -> str:
+    try:
+        import state_store
+        if state_store.enabled():
+            return state_store.get_meta("last_successful_poll") or LAST_SUCCESSFUL_POLL
+    except Exception:
+        pass
     return LAST_SUCCESSFUL_POLL

@@ -20,8 +20,18 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
 
+# Service objects cached per impersonated mailbox for the container lifetime.
+# Rebuilding credentials + discovery client on every call costs an OAuth token
+# exchange each time — wasteful on the every-minute poller hot path. The
+# credentials object refreshes its own token when it expires, so reuse is safe.
+_services: dict = {}
+
 
 def _get_service(sender_email: str):
+    service = _services.get(sender_email)
+    if service is not None:
+        return service
+
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     path = os.environ.get("GOOGLE_SERVICE_ACCOUNT_PATH")
 
@@ -37,7 +47,9 @@ def _get_service(sender_email: str):
 
     # Impersonate the sender so email comes from clark@willcrestpartners.com
     delegated = creds.with_subject(sender_email)
-    return build("gmail", "v1", credentials=delegated)
+    service = build("gmail", "v1", credentials=delegated)
+    _services[sender_email] = service
+    return service
 
 
 def send_email(sender: str, to: str, subject: str, body: str, copy_to_sent: bool = True) -> str:

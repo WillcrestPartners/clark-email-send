@@ -109,7 +109,9 @@ def t_sa_json_fields():
         return _err("Service account fields", f"missing: {', '.join(missing)}")
     if info.get("type") != "service_account":
         return _err("Service account fields", f"type is '{info.get('type')}', expected 'service_account'")
-    return _ok("Service account fields", f"all required fields present (account: {info.get('client_email')})")
+    # Deliberately do NOT echo client_email: this tool is reachable on the
+    # public Function URL and the SA identity is useful recon.
+    return _ok("Service account fields", "all required fields present")
 
 
 def t_app_config_parses():
@@ -248,7 +250,7 @@ def t_caller_authorized(caller_email):
         return _skip("Caller authorized", "app config not available")
     users = config.get("users", {})
     if caller_email not in users:
-        return _err("Caller authorized", f"{caller_email} is not in the authorized user list — ask an admin to add you to APP_CONFIG_JSON in ECS")
+        return _err("Caller authorized", f"{caller_email} is not in the authorized user list — ask an admin to add you to APP_CONFIG_JSON in the clark/email-gateway secret")
     role = users[caller_email].get("role", "user")
     return _ok("Caller authorized", f"{caller_email} (role: {role})")
 
@@ -267,6 +269,7 @@ def t_caller_active(caller_email):
 
 def t_daily_limit(caller_email):
     import access_control
+    import state_store
     config = _get_config()
     if config is None:
         return _skip("Daily limit", "app config not available")
@@ -276,10 +279,14 @@ def t_daily_limit(caller_email):
     default_limit = config.get("global", {}).get("default_daily_limit", 20)
     limit = user.get("daily_limit", default_limit)
     today = datetime.date.today().isoformat()
-    sent_today = access_control._daily_counts.get(today, {}).get(caller_email, 0)
+    # Real counts live in DynamoDB on Lambda; the in-memory dict is local-dev only.
+    if state_store.enabled():
+        sent_today = state_store.get_daily_count(caller_email, today)
+    else:
+        sent_today = access_control._daily_counts.get(today, {}).get(caller_email, 0)
     remaining = limit - sent_today
     if remaining <= 0:
-        return _err("Daily limit", f"{sent_today} of {limit} sends used today — limit reached, resets at midnight or server restart")
+        return _err("Daily limit", f"{sent_today} of {limit} sends used today — limit reached, resets at midnight")
     return _ok("Daily limit", f"{sent_today} of {limit} sends used today, {remaining} remaining")
 
 
@@ -304,11 +311,8 @@ def t_global_settings():
         f"Clark's configured limit is {default_limit}/day per user. Google Workspace hard cap is 2,000 emails/day total."
     )
     lines.append(line)
-    _, line = _warn(
-        "Multiple ECS tasks",
-        "if >1 task is running during a deployment, daily send counts are tracked per-task and may differ between tasks"
-    )
-    lines.append(line)
+    # (The old "multiple ECS tasks" per-task count warning was removed: on
+    # Lambda, daily counts are shared in DynamoDB across all containers.)
     return lines
 
 

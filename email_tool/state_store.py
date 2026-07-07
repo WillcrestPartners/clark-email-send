@@ -12,10 +12,21 @@ leave it unset and fall back to inbound_store's SQLite + access_control's
 in-memory counts. Import is lazy so boto3 is never required for local dev.
 
 Single-table layout (PK attribute name: "pk"):
+  - processing claims:     pk = "CLAIM#<dedup_key>"  (atomic dedup — see below)
   - inbound message rows:  pk = "MSG#<gateway_message_id>", attr rfc822_message_id
   - daily send counters:   pk = "COUNT#<email>#<YYYY-MM-DD>", attr count (Number)
-A sparse GSI "rfc822-index" (PK rfc822_message_id) powers already_seen() without
-a scan. All rows carry a "ttl" epoch so DynamoDB expires bookkeeping data.
+  - metadata:              pk = "META#<key>", attr value
+A sparse GSI "rfc822-index" (PK rfc822_message_id) supports lookups by
+Message-ID. All rows carry a "ttl" epoch so DynamoDB expires bookkeeping data.
+
+Dedup contract: GSIs are eventually consistent and enforce no uniqueness, so
+already_seen() alone cannot prevent two overlapping poller sweeps from
+double-forwarding a message (the SQLite deployment got this for free from its
+UNIQUE constraint). claim_message() restores that guarantee with a
+strongly-consistent conditional put on the base table: exactly one sweep wins
+the claim; the loser skips. confirm_claim() makes the claim a tombstone after
+a successful forward; release_claim() deletes it after a failed forward so the
+message is retried on a later sweep.
 """
 
 import datetime
@@ -43,6 +54,56 @@ def _now_iso() -> str:
 
 def _ttl_epoch() -> int:
     return int((datetime.datetime.utcnow() + datetime.timedelta(days=_TTL_DAYS)).timestamp())
+
+
+# ── processing claims (atomic inbound dedup) ─────────────────────────────────
+
+def claim_message(dedup_key: str) -> bool:
+    """Atomically claim an inbound message. True = we own it; False = already
+    claimed (in-flight or processed). Conditional put on the base table is
+    strongly consistent, unlike the GSI."""
+    from botocore.exceptions import ClientError
+    try:
+        _tbl().put_item(
+            Item={
+                "pk": f"CLAIM#{dedup_key}",
+                "status": "claimed",
+                "created_at": _now_iso(),
+                "ttl": _ttl_epoch(),
+            },
+            ConditionExpression="attribute_not_exists(pk)",
+        )
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def confirm_claim(dedup_key: str, status: str = "acked") -> None:
+    """Mark a claim terminal (acked/ignored/dropped) — stays until TTL expiry."""
+    _tbl().update_item(
+        Key={"pk": f"CLAIM#{dedup_key}"},
+        UpdateExpression="SET #s = :s",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":s": status},
+    )
+
+
+def release_claim(dedup_key: str) -> None:
+    """Delete a claim after a failed forward so a later sweep retries it."""
+    _tbl().delete_item(Key={"pk": f"CLAIM#{dedup_key}"})
+
+
+# ── metadata (e.g. poller health surfaced by /health in the web function) ────
+
+def set_meta(key: str, value: str) -> None:
+    _tbl().put_item(Item={"pk": f"META#{key}", "value": value})
+
+
+def get_meta(key: str):
+    item = _tbl().get_item(Key={"pk": f"META#{key}"}).get("Item")
+    return item.get("value") if item else None
 
 
 # ── inbound message idempotency / audit (mirrors inbound_store's API) ────────
@@ -140,6 +201,20 @@ def increment_daily_count(email: str, day: str) -> int:
         UpdateExpression="ADD #c :one SET #t = if_not_exists(#t, :ttl)",
         ExpressionAttributeNames={"#c": "count", "#t": "ttl"},
         ExpressionAttributeValues={":one": 1, ":ttl": _ttl_epoch()},
+        ReturnValues="UPDATED_NEW",
+    )
+    return int(resp["Attributes"]["count"])
+
+
+def decrement_daily_count(email: str, day: str) -> int:
+    """Atomically decrement (refund) and return the new count. Used when a
+    send fails after the limit was consumed, or to back out an over-limit
+    increment."""
+    resp = _tbl().update_item(
+        Key={"pk": _count_key(email, day)},
+        UpdateExpression="ADD #c :neg",
+        ExpressionAttributeNames={"#c": "count"},
+        ExpressionAttributeValues={":neg": -1},
         ReturnValues="UPDATED_NEW",
     )
     return int(resp["Attributes"]["count"])

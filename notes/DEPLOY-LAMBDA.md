@@ -1,5 +1,12 @@
 # Deploy / cutover runbook — ECS → Lambda
 
+> **Deploys are manual** (build + package + deploy below). The old GitHub
+> Actions workflow that docker-pushed to ECR on every push to `main` was
+> removed 2026-07-07: nothing consumes that image since the ECS gateway was
+> retired, and its IAM user lacked the CloudFormation/Lambda permissions a
+> real CI deploy would need.
+
+
 Migrates the email gateway from the always-on ECS Fargate service
 (`clark-email-service`) to two Lambda functions defined by SAM in
 `infra/template.yaml`:
