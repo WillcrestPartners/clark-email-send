@@ -37,6 +37,9 @@ Globals:
         SENDER_EMAIL: !Ref SenderEmail
         CLARK_WEBHOOK_URL: !Sub "${ClarkBaseUrl}/api/email/inbound"
         CLARK_AUTHORIZED_SENDERS_URL: !Sub "${ClarkBaseUrl}/api/email/authorized-senders"
+        # Base URL for the CIM-intake connector routes (/api/connector/*), used by
+        # the search_companies / analyze_cim / submit_cim_intake MCP tools.
+        CLARK_CONNECTOR_BASE_URL: !Ref ClarkBaseUrl
         AUDIT_LOG_PATH: /tmp/audit_log.jsonl
 
 Resources:
