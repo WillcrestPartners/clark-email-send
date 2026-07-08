@@ -192,6 +192,38 @@ def extract_signature_block(text: str) -> str:
     return ""
 
 
+# ── attachment extraction ───────────────────────────────────────────────────
+
+def extract_attachments(raw_or_payload) -> list:
+    """Return the message's attachment parts as dicts (deterministic, no I/O).
+
+    Each dict: {filename, content_type, size, bytes}. A part counts as an
+    attachment if its Content-Disposition is 'attachment' or it carries a
+    filename (covers inline-but-named parts). Multipart containers and the
+    text/plain|html body parts are skipped. Transport concerns (base64, size
+    caps, which types to forward) are the caller's — this stays a pure parser.
+    """
+    msg = _to_email_message(raw_or_payload)
+    out = []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        disp = str(part.get("Content-Disposition", "")).lower()
+        filename = _decode_header_value(part.get_filename() or "")
+        if "attachment" not in disp and not filename:
+            continue  # a body part, not an attachment
+        data = part.get_payload(decode=True)
+        if not data:
+            continue
+        out.append({
+            "filename": filename or "attachment",
+            "content_type": (part.get_content_type() or "application/octet-stream").lower(),
+            "size": len(data),
+            "bytes": data,
+        })
+    return out
+
+
 # ── envelope assembly ───────────────────────────────────────────────────────
 
 def _headers_from_payload(payload: dict) -> dict:

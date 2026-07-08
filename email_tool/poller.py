@@ -35,6 +35,23 @@ import inbound_store
 LAST_SUCCESSFUL_POLL = None
 
 
+def _attachment_meta(msg) -> list:
+    """Envelope attachment METADATA (filename/content_type/size_bytes) only.
+
+    Attachment CONTENT is deliberately never forwarded — CIMs and other
+    documents enter Clark through the Claude CIM-intake skill, not email. The
+    metadata exists solely so Clark's reply can say "your PDF was not
+    processed; use the CIM intake skill" instead of silently ignoring it."""
+    return [
+        {
+            "filename": att["filename"],
+            "content_type": att["content_type"],
+            "size_bytes": att["size"],
+        }
+        for att in email_parse.extract_attachments(msg)
+    ]
+
+
 def _utc_now_iso() -> str:
     return datetime.datetime.utcnow().isoformat() + "Z"
 
@@ -104,6 +121,12 @@ def _process_message(mailbox: str, msg_id: str, dest_name: str, webhook_url: str
         "body_full_text": parsed["body_full_text"],
         "signature_block": parsed["signature_block"],
     }
+
+    # Attachment metadata only (never content) — lets Clark's reply point the
+    # sender at the CIM-intake skill. Text-only mail keeps the prior envelope.
+    attachments = _attachment_meta(msg)
+    if attachments:
+        envelope["attachments"] = attachments
 
     # Persist as received -> gated -> routed before POSTing.
     inbound_store.record(

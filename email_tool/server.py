@@ -266,6 +266,138 @@ def verify_sender(caller_email: str, from_email: str) -> str:
     )
 
 
+def _connector_base() -> str:
+    """Base URL of Clark's /api/connector/* endpoints (the CIM-intake back end)."""
+    return os.environ.get("CLARK_CONNECTOR_BASE_URL", "").rstrip("/")
+
+
+@mcp.tool()
+def search_companies(caller_email: str, query: str) -> str:
+    """
+    Search Clark for companies that may already exist, so a CIM is not
+    duplicated. Matches on company name, project (deal codename), and aliases.
+
+    Args:
+        caller_email: Your email address (must be an authorized Clark user).
+        query: Company name or deal codename to look up.
+    """
+    import urllib.parse
+
+    base = _connector_base()
+    secret = os.environ.get("CLARK_INBOUND_HMAC_SECRET", "")
+    if not base or not secret:
+        return "CIM intake is not configured (missing CLARK_CONNECTOR_BASE_URL or HMAC secret)."
+    qs = urllib.parse.urlencode({"caller_email": caller_email, "q": query})
+    status, data = clark_client.get_signed(f"{base}/api/connector/companies?{qs}", secret)
+    if status != 200 or not isinstance(data, dict):
+        return f"Company search failed (HTTP {status}): {data}"
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return f'No existing company matches "{query}". You can create a new one.'
+    lines = [
+        f"- {c.get('name')}"
+        + (f" [project: {c.get('project_name')}]" if c.get("project_name") else "")
+        + (f" — {c.get('type')}" if c.get("type") else "")
+        + (f", {c.get('city')}, {c.get('state')}" if c.get("city") or c.get("state") else "")
+        + f"  (id: {c.get('id')})"
+        for c in candidates
+    ]
+    return (
+        f'Possible matches for "{query}" — confirm with the user which to UPDATE, '
+        f"or create a new company:\n" + "\n".join(lines)
+    )
+
+
+@mcp.tool()
+def analyze_cim(caller_email: str, dropbox_folder_path: str) -> str:
+    """
+    Locate the CIM in a Dropbox deal folder and extract its facts (server-side;
+    the PDF is never uploaded through the chat). Returns the extracted JSON for
+    you to review with the user before submitting.
+
+    Args:
+        caller_email: Your email address (must be an authorized Clark user).
+        dropbox_folder_path: Full Dropbox folder path, e.g.
+            "/Willcrest - Sourcing/Opportunities/Franklin Alliance".
+    """
+    base = _connector_base()
+    secret = os.environ.get("CLARK_INBOUND_HMAC_SECRET", "")
+    if not base or not secret:
+        return "CIM intake is not configured (missing CLARK_CONNECTOR_BASE_URL or HMAC secret)."
+    status, data = clark_client.post_signed(
+        f"{base}/api/connector/analyze-cim",
+        secret,
+        {"caller_email": caller_email, "dropbox_folder_path": dropbox_folder_path},
+    )
+    if not isinstance(data, dict):
+        return f"CIM analysis failed (HTTP {status})."
+    st = data.get("status")
+    if st == "ok":
+        import json as _json
+
+        return (
+            f"Analyzed {data['file']['name']}. Extracted facts (review with the user, "
+            f"fill gaps, then call submit_cim_intake):\n"
+            + _json.dumps(data.get("extraction", {}), indent=2)
+        )
+    # non_pdf / empty / error all carry a human-readable message.
+    return data.get("message", f"Could not analyze the folder (status {st}, HTTP {status}).")
+
+
+@mcp.tool()
+def submit_cim_intake(caller_email: str, payload_json: str) -> str:
+    """
+    Submit the user-confirmed CIM data to Clark. Creates a single approval
+    request and returns one-tap Approve/Reject links to show the user IN THIS
+    CHAT — nothing is written to Clark until they approve.
+
+    Args:
+        caller_email: Your email address (must be an authorized Clark user).
+        payload_json: A JSON string with the confirmed intake, shape:
+            {
+              "company": {"mode": "create"|"update", "company_id"?, "name",
+                          "fields": {type, website, description, headline, theme,
+                                     city, state, employee_count, phone, ...}},
+              "financials": [{"year", "revenue_000s", "ebitda_000s"}],
+              "banker": {"first_name","last_name","title","firm","email","phone"},
+              "key_contacts": [{"first_name","last_name","title","email"}],
+              "dropbox_folder_path": "...", "cim_filename": "..."
+            }
+    """
+    import json as _json
+
+    base = _connector_base()
+    secret = os.environ.get("CLARK_INBOUND_HMAC_SECRET", "")
+    if not base or not secret:
+        return "CIM intake is not configured (missing CLARK_CONNECTOR_BASE_URL or HMAC secret)."
+    try:
+        payload = _json.loads(payload_json)
+    except Exception as e:
+        return f"payload_json is not valid JSON: {e}"
+
+    status, data = clark_client.post_signed(
+        f"{base}/api/connector/cim-intake",
+        secret,
+        {"caller_email": caller_email, "payload": payload},
+    )
+    if not isinstance(data, dict):
+        return f"CIM intake failed (HTTP {status})."
+    if status != 200:
+        return f"CIM intake failed (HTTP {status}): {data.get('error', data)}"
+
+    lines = [
+        f"Created approval {data.get('approval_id')} ({data.get('risk_level')} risk, "
+        f"{data.get('action_count')} action(s)). Nothing has been written yet.",
+    ]
+    if data.get("approve_url"):
+        lines.append(f"Approve: {data['approve_url']}")
+        lines.append(f"Reject:  {data['reject_url']}")
+    lines.append(f"Review in Clark: {data.get('app_url')}")
+    if data.get("ambiguous"):
+        lines.append("Note: a reference could not be uniquely resolved — confirm on the approval before approving.")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def send_approval_notification(
     caller_email: str,

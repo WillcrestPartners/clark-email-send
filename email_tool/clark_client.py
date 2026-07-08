@@ -127,12 +127,36 @@ def post_envelope(url: str, secret: str, envelope: dict):
 
     Returns (status_code, response_json_or_None). Treat any 2xx as success.
     """
-    raw = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+    return post_signed(url, secret, envelope)
+
+
+def post_signed(url: str, secret: str, obj: dict):
+    """Signed POST of a JSON object (HMAC over the raw body).
+
+    Returns (status_code, response_json_or_None). Used for the inbound envelope
+    and the /api/connector/* CIM-intake endpoints.
+    """
+    raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "X-Clark-Signature": sign(raw, secret),
     }
     status, body, _ = _request(url, data=raw, headers=headers, method="POST")
+    try:
+        parsed = json.loads(body.decode("utf-8")) if body else None
+    except Exception:
+        parsed = None
+    return status, parsed
+
+
+def get_signed(url: str, secret: str):
+    """Signed GET (HMAC over the EMPTY body, per the contract).
+
+    Returns (status_code, response_json_or_None). Used for the connector
+    company-search endpoint.
+    """
+    headers = {"X-Clark-Signature": sign(b"", secret)}
+    status, body, _ = _request(url, headers=headers, method="GET")
     try:
         parsed = json.loads(body.decode("utf-8")) if body else None
     except Exception:
