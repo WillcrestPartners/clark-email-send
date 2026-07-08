@@ -1,15 +1,19 @@
 """
-Stdlib-only self-test for email_parse attachment + forwarded-thread handling.
+Stdlib-only self-test for email_parse: forwarded-thread handling + attachment
+METADATA extraction.
 
-No pytest / no third-party deps (email_parse imports only the stdlib), so this
-runs anywhere Python 3 is available:
+Attachment content is deliberately never forwarded to Clark — documents enter
+Clark through the Claude CIM-intake skill. The poller only sends attachment
+metadata (filename/content_type/size_bytes) so Clark's reply can tell the
+sender their PDF was not processed.
 
-    python3 email_tool/selftest_attachments.py
+No pytest / no third-party deps (email_parse imports only the stdlib):
+
+    python3 email_tool/selftest_parse.py
 
 Exits non-zero on the first failed assertion.
 """
 
-import base64
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -28,7 +32,7 @@ def _build_forwarded_with_pdf() -> bytes:
     msg["Message-ID"] = "<forward-1@willcrest.com>"
 
     body = (
-        "Clark, please update the company record from the attached CIM.\n\n"
+        "Clark, please add Rich as a contact.\n\n"
         "---------- Forwarded message ----------\n"
         "From: Rich Banker <rich@peakadvisors.com>\n"
         "Subject: Project Falcon\n\n"
@@ -63,7 +67,7 @@ def main():
     check(
         "latest message strips the forwarded history",
         "Forwarded message" not in parsed["instruction_text"]
-        and "please update the company record" in parsed["instruction_text"].lower(),
+        and "please add rich" in parsed["instruction_text"].lower(),
         parsed["instruction_text"],
     )
     check(
@@ -77,10 +81,7 @@ def main():
     a = atts[0]
     check("attachment filename decoded", a["filename"] == "Project Falcon CIM.pdf", a["filename"])
     check("attachment content-type is pdf", "pdf" in a["content_type"], a["content_type"])
-    check("attachment bytes round-trip", a["bytes"] == FAKE_PDF)
-    # The base64 the poller would inline decodes back to the original bytes.
-    b64 = base64.b64encode(a["bytes"]).decode("ascii")
-    check("base64 inline decodes cleanly", base64.b64decode(b64) == FAKE_PDF)
+    check("attachment size reported", a["size"] == len(FAKE_PDF), str(a["size"]))
 
     # A plain text-only message yields no attachments (envelope stays unchanged).
     plain = MIMEText("Just an FYI, no action needed.", "plain")
@@ -88,7 +89,7 @@ def main():
     plain["Subject"] = "fyi"
     check("text-only mail has no attachments", email_parse.extract_attachments(plain.as_bytes()) == [])
 
-    print("\nAll attachment/forwarded-thread self-tests passed.")
+    print("\nAll parse self-tests passed.")
 
 
 if __name__ == "__main__":
