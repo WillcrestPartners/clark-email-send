@@ -398,6 +398,303 @@ def submit_cim_intake(caller_email: str, payload_json: str) -> str:
     return "\n".join(lines)
 
 
+# ── mobile/voice connector tools ────────────────────────────────────────────
+# Thin, signed proxies over Clark's /api/connector/* routes that back the Cowork
+# mobile/voice UI (spec: specs/mobile-voice-interface.md; skill: skills/clark in
+# willcrestpartners/clark). Same contract as the CIM trio above: caller_email is
+# passed through and Clark enforces the authorized-user allow-list + app-layer
+# permissions server-side; GET signs the empty body, POST signs the raw JSON
+# body; both reuse CLARK_INBOUND_HMAC_SECRET over CLARK_CONNECTOR_BASE_URL. The
+# gateway stays a thin transport (no parsing, no LLM, no DB) and returns each
+# route's JSON body straight through to the model.
+
+_CONNECTOR_UNCONFIGURED = (
+    "Clark connector is not configured "
+    "(missing CLARK_CONNECTOR_BASE_URL or HMAC secret)."
+)
+
+
+def _connector_env():
+    """Return (base_url, hmac_secret), or (None, None) if either is missing."""
+    base = _connector_base()
+    secret = os.environ.get("CLARK_INBOUND_HMAC_SECRET", "")
+    if not base or not secret:
+        return None, None
+    return base, secret
+
+
+def _connector_result(action: str, status: int, data) -> str:
+    """Pass a connector route's JSON body back to the model unmodified.
+
+    Detail routes return {"text": ...} already formatted for Claude — surface
+    that string directly. Everything else (the list/shortlist routes, the
+    approval responses, the Granola sync result) is returned as its JSON body.
+    On a non-200 the route's {error} (and {app_url} when present, e.g. the
+    High-risk 403 from act_on_approval) is surfaced so the user can act in-app.
+    """
+    import json as _json
+
+    if not isinstance(data, dict):
+        return f"{action} failed (HTTP {status})."
+    if status != 200:
+        msg = data.get("error", data)
+        app_url = data.get("app_url")
+        if app_url:
+            return f"{action} failed (HTTP {status}): {msg}\nReview in Clark: {app_url}"
+        return f"{action} failed (HTTP {status}): {msg}"
+    if isinstance(data.get("text"), str):
+        return data["text"]
+    return _json.dumps(data, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def search_contacts(
+    caller_email: str,
+    q: str = "",
+    role: str = "",
+    city: str = "",
+    state: str = "",
+    limit: int = 0,
+) -> str:
+    """
+    Look someone up in Clark, or build a shortlist of people: a contact's phone
+    number or email, quick call-prep, "brokers in Dallas", "lenders in Texas".
+    Provide AT LEAST ONE filter; combine them to narrow the shortlist.
+
+    Args:
+        caller_email: Your email address (must be an authorized Clark user).
+        q: Free-text name or email fragment (e.g. "Jane Smith", "acme.com").
+        role: Contact role/type filter (e.g. "Broker", "Lender"); must be a
+            valid Clark contact role.
+        city: One or more cities, comma-separated (e.g. "Dallas,Fort Worth").
+        state: Two-letter state code (e.g. "TX").
+        limit: Max number of results to return (optional).
+    """
+    import urllib.parse
+
+    base, secret = _connector_env()
+    if not base:
+        return _CONNECTOR_UNCONFIGURED
+    params = {"caller_email": caller_email}
+    if q:
+        params["q"] = q
+    if role:
+        params["role"] = role
+    if city:
+        params["city"] = city
+    if state:
+        params["state"] = state
+    if limit:
+        params["limit"] = limit
+    qs = urllib.parse.urlencode(params)
+    status, data = clark_client.get_signed(f"{base}/api/connector/contacts?{qs}", secret)
+    return _connector_result("Contact search", status, data)
+
+
+@mcp.tool()
+def get_contact(caller_email: str, contact_id: str) -> str:
+    """
+    Pull a single contact's full record from Clark by id — phone/mobile, email,
+    company, role, and recent activity for call-prep. Get the id first from
+    search_contacts.
+
+    Args:
+        caller_email: Your email address (must be an authorized Clark user).
+        contact_id: The contact's Clark id (UUID).
+    """
+    import urllib.parse
+
+    base, secret = _connector_env()
+    if not base:
+        return _CONNECTOR_UNCONFIGURED
+    qs = urllib.parse.urlencode({"caller_email": caller_email})
+    status, data = clark_client.get_signed(
+        f"{base}/api/connector/contacts/{urllib.parse.quote(contact_id)}?{qs}", secret
+    )
+    return _connector_result("Contact lookup", status, data)
+
+
+@mcp.tool()
+def get_company(caller_email: str, company_id: str) -> str:
+    """
+    Pull a single company/deal record from Clark by id — profile, financials,
+    banker, key contacts, and status. Get the id first from search_companies.
+
+    Args:
+        caller_email: Your email address (must be an authorized Clark user).
+        company_id: The company's Clark id (UUID).
+    """
+    import urllib.parse
+
+    base, secret = _connector_env()
+    if not base:
+        return _CONNECTOR_UNCONFIGURED
+    qs = urllib.parse.urlencode({"caller_email": caller_email})
+    status, data = clark_client.get_signed(
+        f"{base}/api/connector/companies/{urllib.parse.quote(company_id)}?{qs}", secret
+    )
+    return _connector_result("Company lookup", status, data)
+
+
+@mcp.tool()
+def submit_contact(caller_email: str, payload_json: str, source_text: str = "") -> str:
+    """
+    Add a person to Clark (a new relationship, a recruiting candidate, a banker
+    met at a conference), optionally with the company they belong to and a first
+    activity. Creates a single approval request and returns one-tap
+    Approve/Reject links to show the user IN THIS CHAT — nothing is written to
+    Clark until they approve.
+
+    Args:
+        caller_email: Your email address (must be an authorized Clark user).
+        payload_json: A JSON string with the confirmed contact, shape:
+            {
+              "contact": {"first_name"*, "last_name"*, "title"?, "role"?,
+                          "email"?, "secondary_email"?, "phone"?, "mobile"?,
+                          "city"?, "state"?, "specialty"?, "description"?},
+              "company"?: {"mode": "existing", "company_id"}
+                        | {"mode": "create", "name", "fields"?},
+              "activity"?: {"activity_type"?, "subject"*, "notes"?,
+                            "activity_date"?}
+            }
+            (* required). Risk is Medium when company.mode='create', else Low.
+        source_text: Optional raw text the contact was dictated/derived from.
+    """
+    import json as _json
+
+    base, secret = _connector_env()
+    if not base:
+        return _CONNECTOR_UNCONFIGURED
+    try:
+        payload = _json.loads(payload_json)
+    except Exception as e:
+        return f"payload_json is not valid JSON: {e}"
+
+    body = {"caller_email": caller_email, "payload": payload}
+    if source_text:
+        body["source_text"] = source_text
+    status, data = clark_client.post_signed(
+        f"{base}/api/connector/submit-contact", secret, body
+    )
+    return _connector_result("Add-contact request", status, data)
+
+
+@mcp.tool()
+def submit_activity(caller_email: str, payload_json: str, source_text: str = "") -> str:
+    """
+    Log a call or meeting note in Clark, or re-code an existing activity's links.
+    Use for "log a call with…", "add a note to…", dictated call notes. Names can
+    be dictated (contact_names/company_names) — Clark resolves them, or returns
+    candidates when ambiguous. Creates a single (Low-risk) approval request and
+    returns one-tap Approve/Reject links to show the user IN THIS CHAT — nothing
+    is written until they approve.
+
+    Args:
+        caller_email: Your email address (must be an authorized Clark user).
+        payload_json: A JSON string, shape:
+            {
+              "activity_id"?,      // present = UPDATE mode (edit / re-code links)
+              "contact_ids"?, "company_ids"?,
+              "contact_names"?,    // dictated names; unambiguous ones resolve to
+                                   // ids, ambiguous ones return pick-list candidates
+              "activity_type"?,    // default "Phone Call"
+              "subject"?,          // required in CREATE mode
+              "notes"?, "activity_date"?  // activity_date is YYYY-MM-DD
+            }
+        source_text: Optional raw text the note was dictated/derived from.
+    """
+    import json as _json
+
+    base, secret = _connector_env()
+    if not base:
+        return _CONNECTOR_UNCONFIGURED
+    try:
+        payload = _json.loads(payload_json)
+    except Exception as e:
+        return f"payload_json is not valid JSON: {e}"
+
+    body = {"caller_email": caller_email, "payload": payload}
+    if source_text:
+        body["source_text"] = source_text
+    status, data = clark_client.post_signed(
+        f"{base}/api/connector/submit-activity", secret, body
+    )
+    return _connector_result("Log-activity request", status, data)
+
+
+@mcp.tool()
+def sync_granola(caller_email: str, folder: str = "") -> str:
+    """
+    Pull in recent Granola call/meeting notes from the team folders and import
+    them into Clark as activities. Use for "sync my Granola notes", "pull in the
+    Granola meetings". Runs immediately (no approval). Omit folder to sweep all
+    team folders, or name one to scope the run.
+
+    Args:
+        caller_email: Your email address (must be an authorized Clark user).
+        folder: Optional team-folder name to limit the sync to.
+    """
+    base, secret = _connector_env()
+    if not base:
+        return _CONNECTOR_UNCONFIGURED
+    body = {"caller_email": caller_email}
+    if folder:
+        body["folder"] = folder
+    status, data = clark_client.post_signed(
+        f"{base}/api/connector/sync-granola", secret, body
+    )
+    return _connector_result("Granola sync", status, data)
+
+
+@mcp.tool()
+def list_pending_approvals(caller_email: str) -> str:
+    """
+    Show what's waiting for the user's approval in Clark — "anything waiting for
+    my approval?", "what's in my approval queue?". Returns the pending requests
+    (newest first) with their id, risk level, and summary so the user can then
+    approve or reject one by id via act_on_approval.
+
+    Args:
+        caller_email: Your email address (must be an authorized Clark user).
+    """
+    import urllib.parse
+
+    base, secret = _connector_env()
+    if not base:
+        return _CONNECTOR_UNCONFIGURED
+    qs = urllib.parse.urlencode({"caller_email": caller_email})
+    status, data = clark_client.get_signed(
+        f"{base}/api/connector/approvals?{qs}", secret
+    )
+    return _connector_result("Approvals list", status, data)
+
+
+@mcp.tool()
+def act_on_approval(caller_email: str, approval_id: str, decision: str) -> str:
+    """
+    Approve or reject a pending Clark approval by id. Call this ONLY on the
+    user's explicit spoken/typed approve-or-reject instruction — never on your
+    own initiative. High-risk requests cannot be decided here: Clark rejects
+    them server-side (403) and they must be reviewed in the app (this note is a
+    courtesy; Clark enforces it, along with no-self-approval). Idempotent — a
+    request that was already decided returns its current status.
+
+    Args:
+        caller_email: Your email address (must be an authorized Clark user).
+        approval_id: The id of the approval to act on (from list_pending_approvals).
+        decision: Either "approve" or "reject".
+    """
+    base, secret = _connector_env()
+    if not base:
+        return _CONNECTOR_UNCONFIGURED
+    status, data = clark_client.post_signed(
+        f"{base}/api/connector/approvals/act",
+        secret,
+        {"caller_email": caller_email, "approval_id": approval_id, "decision": decision},
+    )
+    return _connector_result("Approval decision", status, data)
+
+
 @mcp.tool()
 def send_approval_notification(
     caller_email: str,

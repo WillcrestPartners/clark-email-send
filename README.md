@@ -51,6 +51,26 @@ signature, 5xx on send failure.
 | `verify_sender` | Any user | Report whether an address is on the cached allow-list. |
 | `send_approval_notification` | Admins | Manually relay a (threaded) reply from clark@. |
 
+**Connector-backed tools** (CIM intake + the Cowork mobile/voice UI). Thin,
+HMAC-signed proxies over Clark's `/api/connector/*` routes — `caller_email` is
+passed through and Clark enforces the authorized-user allow-list and app-layer
+permissions server-side. All reuse `CLARK_INBOUND_HMAC_SECRET` +
+`CLARK_CONNECTOR_BASE_URL`; no new infra or auth model.
+
+| Tool | Who | What |
+|---|---|---|
+| `search_companies` | Clark users | Find existing companies/deals so a CIM isn't duplicated. |
+| `analyze_cim` | Clark users | Extract facts from a CIM in a Dropbox deal folder (server-side). |
+| `submit_cim_intake` | Clark users | Submit confirmed CIM data → one approval with one-tap links. |
+| `search_contacts` | Clark users | Look up a person or build a shortlist ("brokers in Dallas"). |
+| `get_contact` | Clark users | Full contact record by id (call-prep). |
+| `get_company` | Clark users | Full company/deal record by id. |
+| `submit_contact` | Clark users | Add a person (+ optional company/activity) → approval with one-tap links. |
+| `submit_activity` | Clark users | Log/re-code a call or meeting note → approval with one-tap links. |
+| `sync_granola` | Clark users | Import recent Granola team-folder notes as activities. |
+| `list_pending_approvals` | Clark users | Show what's waiting for the user's approval. |
+| `act_on_approval` | Clark users | Approve/reject a pending request by id (High-risk rejected server-side). |
+
 `/health` now returns JSON including `inbound_enabled` and `last_successful_poll`.
 
 **New environment variables** (see `.env.example`):
