@@ -6,6 +6,19 @@
 > retired, and its IAM user lacked the CloudFormation/Lambda permissions a
 > real CI deploy would need.
 
+> **STATUS — cutover complete (2026-07-06); Lambda is the live gateway.** This is
+> now the **standard deploy runbook**, not just a migration doc. For a routine
+> code or config change the whole loop is **(b) Build** + **(c) Deploy** (the
+> **(a)** prerequisites are already satisfied). Sections **(d) Cutover** and
+> **(e) Rollback** are the one-time ECS↔Lambda switchover steps — now **legacy**
+> (ECS is retired), kept for history. Last deployed **2026-07-22** (mobile/voice
+> connector MCP tools; verified — all 18 tools live).
+
+> **Where to run it:** anywhere with the `Clark-deployer` IAM credentials and the
+> AWS CLI configured for **us-east-1** — AWS CloudShell, a GitHub Codespace, or any
+> comparable shell. Run every command **from the repo root** (`clark-email-send/`);
+> the `cp email_tool/*.py …` line in (b) doubles as your "am I in the right
+> directory?" check.
 
 Migrates the email gateway from the always-on ECS Fargate service
 (`clark-email-service`) to two Lambda functions defined by SAM in
@@ -22,7 +35,8 @@ Migrates the email gateway from the always-on ECS Fargate service
   breaking every route after the first request.)
 - **`clark-email-poller`** — `poller.poll_once()` once per invocation, driven by
   an EventBridge schedule `rate(1 minute)`, reserved concurrency 1. Handler
-  `lambda_poll.handler`. Schedule gated by the `PollerEnabled` CFN parameter.
+  `lambda_poll.handler`. The schedule is hardcoded `Enabled: true` in the
+  template — it runs whenever the stack is deployed (no enable/disable parameter).
 
 The gateway↔Clark contract is **unchanged**: `X-Clark-Signature =
 "sha256=" + HMAC-SHA256(raw body)`; the allow-list GET signs the empty string;
@@ -83,13 +97,19 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM \
   --region us-east-1 \
   --parameter-overrides \
-    SecretsArn=arn:aws:secretsmanager:us-east-1:626928146978:secret:clark/email-gateway-HRkKkY \
-    PollerEnabled=false
+    SecretsArn=arn:aws:secretsmanager:us-east-1:626928146978:secret:clark/email-gateway-HRkKkY
 ```
 
-Deploy first with **`PollerEnabled=false`** so the poller does not run while ECS
-is still live (avoids double-processing inbound mail). The deployed
-`clark-email-web` Function URL is:
+> **Do NOT pass `PollerEnabled`.** That parameter was removed from `template.yaml`
+> once cutover finished; the poller's EventBridge schedule is now hardcoded
+> `Enabled: true`, so it runs whenever the stack is deployed. Passing
+> `PollerEnabled=...` makes CloudFormation fail with *"Parameters: [PollerEnabled]
+> do not exist in the template."* The template's other parameters (`ClarkBaseUrl`,
+> `SenderEmail`) have defaults and keep their current values when omitted, so
+> `SecretsArn` is normally the only override you pass. Because the poller is
+> always on, a redeploy **cannot** accidentally disable inbound polling.
+
+The deployed `clark-email-web` Function URL is:
 
 ```
 https://msbqvpq53fvvrd5o4o5kxv4jh40syise.lambda-url.us-east-1.on.aws/
@@ -111,13 +131,38 @@ Smoke-test the web function (LWA + uvicorn) before cutover:
 - `POST /mcp` `initialize` then `tools/list` → **200** returning the tool list.
   The MCP endpoint is `/mcp` (**no trailing slash**).
 
+**If the public Function URL is unreachable** (e.g. an egress policy blocks
+`*.lambda-url.on.aws`, as in Claude Code on the web), verify by invoking the
+function **directly through the AWS API** instead — same code path, no public URL
+needed. Send a Function-URL v2 event via `aws lambda invoke --function-name
+clark-email-web` (or `boto3`) and read the `{statusCode, body}` it returns:
+
+```json
+{"version":"2.0","rawPath":"/health","rawQueryString":"",
+ "headers":{"content-type":"application/json"},
+ "requestContext":{"http":{"method":"GET","path":"/health"}},"isBase64Encoded":false}
+```
+
+For `tools/list`, POST `/mcp` with an `initialize` request (stateless mode returns
+no `mcp-session-id`), then a `tools/list` request; the response body is JSON (or
+SSE `data:` lines to parse). This is exactly how the **2026-07-22** deploy was
+verified from Claude Code on the web: `/health` → 200 with a fresh
+`last_successful_poll`, and `tools/list` → **all 18 tools**, including the 8
+mobile/voice tools (`search_contacts`, `get_contact`, `get_company`,
+`submit_contact`, `submit_activity`, `sync_granola`, `list_pending_approvals`,
+`act_on_approval`).
+
 If a route works on the first request but later routes fail, that is the Mangum
 lifespan/MCP-session-manager bug the LWA switch fixed — confirm `run.sh` + the LWA
 layer/env are in place.
 
 ---
 
-## (d) Cutover
+## (d) Cutover — ✅ DONE 2026-07-06 (legacy — ECS retired; kept for history)
+
+> One-time ECS→Lambda switchover steps. Complete; **not** part of a routine
+> deploy. **Ignore the `PollerEnabled=true` override in step 3** — that parameter
+> no longer exists (see §c); the poller is hardcoded on.
 
 1. **Verify the web function** against `<FunctionUrl>` while ECS still serves prod:
    - `GET <FunctionUrl>health` → `{"status":"ok",...}`
@@ -149,7 +194,13 @@ layer/env are in place.
 
 ---
 
-## (e) Rollback
+## (e) Rollback — legacy (ECS is retired; kept for history)
+
+> ECS-based rollback no longer applies. **To roll back a bad Lambda deploy
+> today:** re-run **(b)+(c)** from the previous known-good commit — CloudFormation
+> updates the stack in place, and a failed update rolls back automatically. The
+> steps below are the original cutover-era rollback and reference `PollerEnabled`
+> (removed) and ECS (retired).
 
 1. Redeploy stack with `PollerEnabled=false` (stops the Lambda poller).
 2. Scale ECS back up:
