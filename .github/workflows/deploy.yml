@@ -1,0 +1,96 @@
+name: Deploy gateway (SAM)
+
+# Auto-deploy the Clark email gateway on merge to main. Auth is via GitHub
+# OIDC (no long-lived AWS keys stored in the repo) assuming a scoped IAM role;
+# see notes/DEPLOY-LAMBDA.md "Auto-deploy" for the one-time role bootstrap and
+# the AWS_DEPLOY_ROLE_ARN repo variable this reads.
+#
+# Security note: this pipeline ships CODE only. It deliberately does NOT pass
+# ConnectorAuthRequired or ConnectorDcrShim, so a routine merge can never flip
+# the /mcp enforcement posture — `aws cloudformation deploy` preserves the
+# previously-deployed value of any parameter it isn't given. Flip the flag with
+# a deliberate one-off deploy (runbook step), not by merging.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "email_tool/**"
+      - "infra/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: gateway-deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # mint the OIDC token used to assume the deploy role
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: clark-email-gateway
+  # Non-secret ARNs / names (same values the manual runbook uses).
+  SECRETS_ARN: arn:aws:secretsmanager:us-east-1:626928146978:secret:clark/email-gateway-HRkKkY
+  ASSET_BUCKET: cdk-hnb659fds-assets-626928146978-us-east-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build Lambda bundle
+        run: |
+          rm -rf build && mkdir build
+          cp email_tool/*.py build/
+          cp email_tool/run.sh build/
+          chmod +x build/run.sh
+          pip install -r email_tool/requirements.txt -t build/ \
+            --platform manylinux2014_x86_64 --python-version 3.12 --only-binary=:all:
+
+      - name: Package
+        working-directory: infra
+        run: |
+          aws cloudformation package \
+            --template-file template.yaml \
+            --s3-bucket "$ASSET_BUCKET" \
+            --s3-prefix clark-email-gateway \
+            --output-template-file packaged.yaml \
+            --region "$AWS_REGION"
+
+      - name: Read ClarkAuth outputs (connector OAuth wiring)
+        id: auth
+        run: |
+          q() { aws cloudformation describe-stacks --stack-name ClarkAuth \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          echo "pool_id=$(q UserPoolId)"     >> "$GITHUB_OUTPUT"
+          echo "domain=$(q HostedUiDomain)"  >> "$GITHUB_OUTPUT"
+          echo "client_id=$(q ConnectorClientId)" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy
+        working-directory: infra
+        run: |
+          aws cloudformation deploy \
+            --template-file packaged.yaml \
+            --stack-name "$STACK_NAME" \
+            --capabilities CAPABILITY_IAM \
+            --region "$AWS_REGION" \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              SecretsArn="$SECRETS_ARN" \
+              ConnectorCognitoPoolId="${{ steps.auth.outputs.pool_id }}" \
+              ConnectorCognitoDomain="${{ steps.auth.outputs.domain }}" \
+              ConnectorClientId="${{ steps.auth.outputs.client_id }}"
