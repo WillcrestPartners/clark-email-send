@@ -141,8 +141,19 @@ aws cloudformation describe-stacks --stack-name ClarkAuth --region us-east-1 \
 The deployed `clark-email-web` Function URL is:
 
 ```
-https://msbqvpq53fvvrd5o4o5kxv4jh40syise.lambda-url.us-east-1.on.aws/
+https://rsug7xmtqbzyxeqgenw3uragje0xupnj.lambda-url.us-east-1.on.aws/
 ```
+
+> **Rotated 2026-07-22** (post-cutover hardening, `specs/connector-oauth.md`
+> §5 in the Clark repo — the pre-OAuth URL had circulated as the only secret
+> gating `/mcp`, so it was deleted + recreated to make that knowledge
+> worthless). If this URL ever needs to change again: `aws lambda
+> delete-function-url-config` + `create-function-url-config` for
+> `clark-email-web`, then repoint `clark/app`'s `EMAIL_GATEWAY_SEND_URL`
+> secret (fetch-edit-put the JSON, preserving the other keys), force a new
+> ECS deployment (`cluster clark`, `service clark`) so it picks up the new
+> secret, and update the claude.ai connector's URL. Verified live 2026-07-22
+> as bforster@willcrest.com via the Cowork connector.
 
 Call it `<FunctionUrl>` below (it ends in `/`).
 
@@ -227,7 +238,8 @@ layer/env are in place.
        PollerEnabled=true
    ```
 4. **Repoint Clark** (Function URL
-   `https://msbqvpq53fvvrd5o4o5kxv4jh40syise.lambda-url.us-east-1.on.aws/`):
+   `https://msbqvpq53fvvrd5o4o5kxv4jh40syise.lambda-url.us-east-1.on.aws/` —
+   **superseded 2026-07-22, see §c for the current URL**):
    - `clark/app` `EMAIL_GATEWAY_SEND_URL` →
      `https://msbqvpq53fvvrd5o4o5kxv4jh40syise.lambda-url.us-east-1.on.aws/send`
    - Cowork MCP connector →

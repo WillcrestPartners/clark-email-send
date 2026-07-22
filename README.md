@@ -183,20 +183,34 @@ next cold start (or force one by redeploying the stack). *(Legacy ECS: this valu
 lived in the `clark-email-service` task definition and was applied by incrementing
 `REDEPLOY`.)*
 
-### 2. Enable the connector in their Claude account
+### 2. Connect the connector with their own Google login
 
-The new user must go to **claude.ai → Settings → Connectors** and enable the **Clark Email Tool** connector for their account. The connector URL is the gateway's `/mcp` path:
+Since the connector-OAuth cutover (2026-07-22, `specs/connector-oauth.md` in
+the Clark repo), identity comes from a per-user Cognito/Google-SSO token, not
+a self-asserted `caller_email` — **each new user connects with their own
+Willcrest Google account**; there is nothing to configure per-user beyond
+step 1 above (their entry in `APP_CONFIG_JSON` / Clark's own user list).
+
+If the connector ("Clark Connector") isn't already added on their account:
+**claude.ai → Settings → Connectors → Add custom connector**, URL:
 
 ```
-https://msbqvpq53fvvrd5o4o5kxv4jh40syise.lambda-url.us-east-1.on.aws/mcp   (live — Lambda Function URL)
+https://rsug7xmtqbzyxeqgenw3uragje0xupnj.lambda-url.us-east-1.on.aws/mcp
 ```
 
-> The Lambda cutover is complete (2026-07-06); the live connector URL is the
-> **Lambda Function URL** + `/mcp` shown above. The old ECS host
-> (`https://cl-874b2f3a18c5475dbfbd921b886e8153.ecs.us-east-1.on.aws/mcp`) is
-> retired.
+Under **Advanced settings**, OAuth Client ID `qgrpji1j1t9evtn7vhicsrikt` (leave
+Client Secret blank — it's a public PKCE client). Click **Connect**, sign in
+with their Willcrest Google account. If the connector is already added on the
+account, they just need to hit **Connect** and sign in — no URL/client id
+re-entry needed.
 
-After enabling, they should start a **new conversation** in Claude Cowork to load the tools.
+> **Function URL rotated 2026-07-22** (post-cutover hardening — the old URL
+> had circulated as the only secret). The URL above is current; if it's
+> rotated again, update it here — see `notes/DEPLOY-LAMBDA.md` §c.
+
+After connecting, they should start a **new conversation** in Claude Cowork
+to load the tools, and their first tool call (e.g. "check my access") should
+resolve to their own email with no identity questions asked.
 
 ---
 
