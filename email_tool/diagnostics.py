@@ -60,7 +60,7 @@ def _refresh_token(info, scope):
     """Attempt a token refresh for the given scope to verify it is authorized."""
     import httplib2
     from google.oauth2 import service_account
-    from google.auth.transport.httplib2 import Request
+    from google_auth_httplib2 import Request
     creds = service_account.Credentials.from_service_account_info(
         info, scopes=[scope]
     ).with_subject(_get_sender())
