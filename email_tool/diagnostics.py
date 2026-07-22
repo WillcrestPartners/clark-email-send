@@ -203,6 +203,28 @@ def t_gmail_readonly_scope():
         return _err("Gmail readonly scope", err)
 
 
+def t_connector_oauth():
+    import oauth
+    if not oauth.configured():
+        if oauth.auth_required():
+            return _err(
+                "Connector OAuth",
+                "CONNECTOR_AUTH_REQUIRED is true but the Cognito pool/client/domain "
+                "env vars are not set — every /mcp call will be rejected",
+            )
+        return _warn(
+            "Connector OAuth",
+            "not configured — /mcp identity falls back to the legacy "
+            "self-asserted caller_email (pre-OAuth behavior)",
+        )
+    mode = (
+        "ENFORCED (bearer token required on /mcp)"
+        if oauth.auth_required()
+        else "flag off — token honored when present, legacy caller_email accepted"
+    )
+    return _info("Connector OAuth", f"{mode}; issuer={oauth.issuer()}")
+
+
 def t_inbound_status():
     import access_control
     import poller
@@ -332,6 +354,7 @@ def run_all(caller_email: str) -> str:
         t_gmail_modify_scope,
         t_gmail_readonly_scope,
         t_sender_mailbox,
+        t_connector_oauth,
         t_inbound_status,
     ]
 

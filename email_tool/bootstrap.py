@@ -16,13 +16,14 @@ import json
 import os
 
 # Keys we lift out of the JSON secret into the process environment.
-# GATEWAY_MCP_TOKEN is optional: when present, /mcp requires it as a bearer
-# token (see server._token_guard); when absent, /mcp stays open as before.
+# (GATEWAY_MCP_TOKEN was removed 2026-07-22: the optional shared-secret /mcp
+# guard it fed is superseded by per-user OAuth — see oauth.py. The Cognito
+# pool/client/domain values OAuth needs are NOT secrets and arrive as plain
+# Lambda env vars from infra/template.yaml parameters, not from this secret.)
 _SECRET_KEYS = (
     "GOOGLE_SERVICE_ACCOUNT_JSON",
     "CLARK_INBOUND_HMAC_SECRET",
     "APP_CONFIG_JSON",
-    "GATEWAY_MCP_TOKEN",
 )
 
 _loaded = False

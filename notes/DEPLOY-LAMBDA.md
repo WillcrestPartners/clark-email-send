@@ -109,6 +109,28 @@ aws cloudformation deploy \
 > `SecretsArn` is normally the only override you pass. Because the poller is
 > always on, a redeploy **cannot** accidentally disable inbound polling.
 
+### Per-user OAuth parameters (`/mcp` — specs/connector-oauth.md in the Clark repo)
+
+Five more parameters wire the OAuth middleware (`email_tool/oauth.py`). None
+are secrets, and like every CloudFormation parameter they **keep their
+previously-deployed values when omitted** from `--parameter-overrides` — so
+routine deploys after the OAuth cutover still pass only `SecretsArn`.
+
+| Parameter | Value |
+|---|---|
+| `ConnectorCognitoPoolId` | ClarkAuth stack `UserPoolId` output (e.g. `us-east-1_XXXXXXXXX`) |
+| `ConnectorCognitoDomain` | ClarkAuth stack `HostedUiDomain` output (e.g. `https://willcrest-clark.auth.us-east-1.amazoncognito.com`) |
+| `ConnectorClientId` | ClarkAuth stack `ConnectorClientId` output (the `clark-connector` app client) |
+| `ConnectorAuthRequired` | `false` on the first OAuth deploy (transition: tokens honored, legacy `caller_email` still accepted); flip to `true` once the claude.ai connector is re-added with OAuth working |
+| `ConnectorDcrShim` | leave `false` (only for the fallback where claude.ai's Advanced-settings client-credentials entry is unavailable) |
+
+Read the ClarkAuth outputs with:
+
+```bash
+aws cloudformation describe-stacks --stack-name ClarkAuth --region us-east-1 \
+  --query "Stacks[0].Outputs" --output table
+```
+
 The deployed `clark-email-web` Function URL is:
 
 ```
@@ -155,6 +177,18 @@ mobile/voice tools (`search_contacts`, `get_contact`, `get_company`,
 If a route works on the first request but later routes fail, that is the Mangum
 lifespan/MCP-session-manager bug the LWA switch fixed — confirm `run.sh` + the LWA
 layer/env are in place.
+
+**OAuth middleware checks** (after the connector-oauth deploy):
+
+- `GET /.well-known/oauth-protected-resource` → **200** naming the Cognito
+  issuer in `authorization_servers`.
+- With `ConnectorAuthRequired=false`: `POST /mcp` `tools/list` with no token →
+  **200**; **no tool schema contains `caller_email`**.
+- With `ConnectorAuthRequired=true`: `POST /mcp` with no/garbage token →
+  **401** with a `WWW-Authenticate` header pointing at the resource metadata;
+  with a fresh token from the connector → 200.
+- Full offline coverage: `python3 email_tool/selftest_oauth.py` (runs both
+  modes; needs the pip deps but no AWS).
 
 ---
 

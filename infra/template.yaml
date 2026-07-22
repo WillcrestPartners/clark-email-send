@@ -24,6 +24,45 @@ Parameters:
   SenderEmail:
     Type: String
     Default: clark@willcrestpartners.com
+  # ── Per-user OAuth on /mcp (specs/connector-oauth.md in the Clark repo) ──
+  # None of these are secrets: pool id / client id / Hosted UI domain come from
+  # the ClarkAuth CDK stack outputs (client "clark-connector" is a PUBLIC
+  # client — PKCE, no secret). Leave the Connector* values as-is on routine
+  # deploys once set; CloudFormation keeps previous parameter values when
+  # --parameter-overrides omits them.
+  ConnectorAuthRequired:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Cutover flag. "false" = middleware verifies/injects identity from a
+      bearer token when present but token-less calls still work (legacy
+      self-asserted caller_email honored). "true" = /mcp rejects anything
+      without a valid Cognito token (401 + WWW-Authenticate).
+  ConnectorCognitoPoolId:
+    Type: String
+    Default: ""
+    Description: Cognito user pool id (e.g. us-east-1_XXXXXXXXX) — the pool behind
+      clark.willcrestpartners.com logins. From the ClarkAuth stack UserPoolId output.
+  ConnectorCognitoDomain:
+    Type: String
+    Default: ""
+    Description: Cognito Hosted UI base URL
+      (e.g. https://willcrest-clark.auth.us-east-1.amazoncognito.com); its
+      /oauth2/userInfo endpoint validates tokens + resolves the email. From the
+      ClarkAuth stack HostedUiDomain output.
+  ConnectorClientId:
+    Type: String
+    Default: ""
+    Description: App client id of "clark-connector" (the claude.ai connector client).
+      From the ClarkAuth stack ConnectorClientId output.
+  ConnectorDcrShim:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Serve the static dynamic-client-registration shim
+      (/.well-known/oauth-authorization-server + /register). Only needed if
+      claude.ai's manual client-credentials path (connector Advanced settings)
+      turns out to be unavailable; leave "false" otherwise.
 
 Globals:
   Function:
@@ -87,6 +126,13 @@ Resources:
           AWS_LWA_INVOKE_MODE: buffered
           PORT: "8080"
           MCP_STATELESS_HTTP: "true"
+          # Per-user OAuth on /mcp (oauth.py). Web function only — the poller
+          # never serves MCP traffic.
+          CONNECTOR_AUTH_REQUIRED: !Ref ConnectorAuthRequired
+          CONNECTOR_COGNITO_POOL_ID: !Ref ConnectorCognitoPoolId
+          CONNECTOR_COGNITO_DOMAIN: !Ref ConnectorCognitoDomain
+          CONNECTOR_CLIENT_ID: !Ref ConnectorClientId
+          CONNECTOR_DCR_SHIM: !Ref ConnectorDcrShim
       FunctionUrlConfig:
         AuthType: NONE
       Policies:
