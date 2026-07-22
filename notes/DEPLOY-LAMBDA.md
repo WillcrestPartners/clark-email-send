@@ -1,10 +1,17 @@
 # Deploy / cutover runbook — ECS → Lambda
 
-> **Deploys are manual** (build + package + deploy below). The old GitHub
-> Actions workflow that docker-pushed to ECR on every push to `main` was
-> removed 2026-07-07: nothing consumes that image since the ECS gateway was
-> retired, and its IAM user lacked the CloudFormation/Lambda permissions a
-> real CI deploy would need.
+> **Auto-deploy (2026-07-22):** merges to `main` now build + SAM-deploy the
+> stack automatically via `.github/workflows/deploy.yml` (GitHub OIDC, no
+> stored AWS keys). See **section (g) Auto-deploy** below for the pipeline and
+> its one-time IAM-role bootstrap. The manual runbook (b)+(c) below still works
+> and is the fallback / first-deploy path; a manual deploy and an auto-deploy
+> are the same commands, so they can't drift.
+>
+> **Earlier note (superseded):** the *original* GitHub Actions workflow that
+> docker-pushed to ECR on every push to `main` was removed 2026-07-07 (nothing
+> consumed that image after the ECS gateway retired, and its IAM user lacked
+> CloudFormation/Lambda permissions). The new workflow is unrelated: it drives
+> the SAM/CloudFormation deploy and assumes a purpose-built, scoped role.
 
 > **STATUS — cutover complete (2026-07-06); Lambda is the live gateway.** This is
 > now the **standard deploy runbook**, not just a migration doc. For a routine
@@ -109,6 +116,28 @@ aws cloudformation deploy \
 > `SecretsArn` is normally the only override you pass. Because the poller is
 > always on, a redeploy **cannot** accidentally disable inbound polling.
 
+### Per-user OAuth parameters (`/mcp` — specs/connector-oauth.md in the Clark repo)
+
+Five more parameters wire the OAuth middleware (`email_tool/oauth.py`). None
+are secrets, and like every CloudFormation parameter they **keep their
+previously-deployed values when omitted** from `--parameter-overrides` — so
+routine deploys after the OAuth cutover still pass only `SecretsArn`.
+
+| Parameter | Value |
+|---|---|
+| `ConnectorCognitoPoolId` | ClarkAuth stack `UserPoolId` output (e.g. `us-east-1_XXXXXXXXX`) |
+| `ConnectorCognitoDomain` | ClarkAuth stack `HostedUiDomain` output (e.g. `https://willcrest-clark.auth.us-east-1.amazoncognito.com`) |
+| `ConnectorClientId` | ClarkAuth stack `ConnectorClientId` output (the `clark-connector` app client) |
+| `ConnectorAuthRequired` | `false` on the first OAuth deploy (transition: tokens honored, legacy `caller_email` still accepted); flip to `true` once the claude.ai connector is re-added with OAuth working |
+| `ConnectorDcrShim` | leave `false` (only for the fallback where claude.ai's Advanced-settings client-credentials entry is unavailable) |
+
+Read the ClarkAuth outputs with:
+
+```bash
+aws cloudformation describe-stacks --stack-name ClarkAuth --region us-east-1 \
+  --query "Stacks[0].Outputs" --output table
+```
+
 The deployed `clark-email-web` Function URL is:
 
 ```
@@ -155,6 +184,18 @@ mobile/voice tools (`search_contacts`, `get_contact`, `get_company`,
 If a route works on the first request but later routes fail, that is the Mangum
 lifespan/MCP-session-manager bug the LWA switch fixed — confirm `run.sh` + the LWA
 layer/env are in place.
+
+**OAuth middleware checks** (after the connector-oauth deploy):
+
+- `GET /.well-known/oauth-protected-resource` → **200** naming the Cognito
+  issuer in `authorization_servers`.
+- With `ConnectorAuthRequired=false`: `POST /mcp` `tools/list` with no token →
+  **200**; **no tool schema contains `caller_email`**.
+- With `ConnectorAuthRequired=true`: `POST /mcp` with no/garbage token →
+  **401** with a `WWW-Authenticate` header pointing at the resource metadata;
+  with a fresh token from the connector → 200.
+- Full offline coverage: `python3 email_tool/selftest_oauth.py` (runs both
+  modes; needs the pip deps but no AWS).
 
 ---
 
@@ -224,3 +265,120 @@ layer/env are in place.
   - `/aws/lambda/clark-email-web` — `/send` relay + MCP activity.
 - `GET <FunctionUrl>health` → `inbound_enabled:true` and a recent
   `last_successful_poll`.
+
+---
+
+## (g) Auto-deploy (GitHub Actions + OIDC)
+
+`.github/workflows/deploy.yml` runs the exact **(b) Build + (c) Deploy** loop
+on every push to `main` that touches `email_tool/**`, `infra/**`, or the
+workflow itself (also runnable on demand via *Actions → Deploy gateway (SAM) →
+Run workflow*). It authenticates with **GitHub OIDC** — a short-lived token
+exchanged for a scoped IAM role, so **no AWS keys are stored in GitHub**.
+
+**What the pipeline does and does NOT do**
+
+- Reads the three connector-OAuth wiring values (`UserPoolId`,
+  `HostedUiDomain`, `ConnectorClientId`) live from the `ClarkAuth` stack
+  outputs, so they never need to be re-typed and stay correct if the pool is
+  ever rebuilt.
+- Passes `SecretsArn` (a non-secret ARN, in the workflow `env`).
+- **Deliberately does not pass `ConnectorAuthRequired` or `ConnectorDcrShim`.**
+  `aws cloudformation deploy` preserves the previously-deployed value of any
+  parameter it isn't given, so a routine merge ships code but can never flip
+  `/mcp` enforcement on or off. Change the flag only with a deliberate one-off
+  manual deploy (pass `ConnectorAuthRequired=true`) — see section (c).
+- Never passes `PollerEnabled` (removed — see §c).
+
+### One-time bootstrap (privileged; do once)
+
+The pipeline assumes an IAM role that must exist first. Requires an identity
+that can create IAM roles (an admin, or `clark-deployer` if it has `iam:*` on
+`role/clark-email-gateway-*`). The account already has the GitHub OIDC provider
+(created by Clark's CDK), so we reuse it.
+
+1. **Confirm the OIDC provider ARN** (expected
+   `arn:aws:iam::626928146978:oidc-provider/token.actions.githubusercontent.com`):
+
+   ```bash
+   aws iam list-open-id-connect-providers
+   ```
+
+2. **Create the deploy role**, trusting *only* this repo's `main` branch:
+
+   ```bash
+   cat > /tmp/trust.json <<'JSON'
+   {
+     "Version": "2012-10-17",
+     "Statement": [{
+       "Effect": "Allow",
+       "Principal": { "Federated": "arn:aws:iam::626928146978:oidc-provider/token.actions.githubusercontent.com" },
+       "Action": "sts:AssumeRoleWithWebIdentity",
+       "Condition": {
+         "StringEquals": {
+           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+           "token.actions.githubusercontent.com:sub": "repo:WillcrestPartners/clark-email-send:ref:refs/heads/main"
+         }
+       }
+     }]
+   }
+   JSON
+   aws iam create-role --role-name clark-email-gateway-deployer \
+     --assume-role-policy-document file:///tmp/trust.json \
+     --description "GitHub Actions OIDC role: SAM-deploy the email gateway from main"
+   ```
+
+3. **Attach a scoped permissions policy.** The dangerous verb (IAM) is limited
+   to the stack's own auto-created roles; the service verbs are account-wide
+   for deploy reliability (tighten later if desired):
+
+   ```bash
+   cat > /tmp/perms.json <<'JSON'
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       { "Sid": "Cfn",    "Effect": "Allow", "Action": "cloudformation:*", "Resource": "*" },
+       { "Sid": "Lambda", "Effect": "Allow", "Action": "lambda:*",         "Resource": "*" },
+       { "Sid": "Dynamo", "Effect": "Allow", "Action": "dynamodb:*",       "Resource": "*" },
+       { "Sid": "Events", "Effect": "Allow", "Action": "events:*",         "Resource": "*" },
+       { "Sid": "Logs",   "Effect": "Allow", "Action": "logs:*",           "Resource": "*" },
+       { "Sid": "AssetBucket", "Effect": "Allow",
+         "Action": ["s3:GetObject","s3:PutObject","s3:GetBucketLocation","s3:ListBucket"],
+         "Resource": [
+           "arn:aws:s3:::cdk-hnb659fds-assets-626928146978-us-east-1",
+           "arn:aws:s3:::cdk-hnb659fds-assets-626928146978-us-east-1/*"
+         ] },
+       { "Sid": "IamForStackRolesOnly", "Effect": "Allow",
+         "Action": ["iam:CreateRole","iam:DeleteRole","iam:GetRole","iam:PassRole",
+                    "iam:AttachRolePolicy","iam:DetachRolePolicy","iam:PutRolePolicy",
+                    "iam:DeleteRolePolicy","iam:GetRolePolicy","iam:TagRole","iam:UntagRole",
+                    "iam:ListRolePolicies","iam:ListAttachedRolePolicies"],
+         "Resource": "arn:aws:iam::626928146978:role/clark-email-gateway-*" }
+     ]
+   }
+   JSON
+   aws iam put-role-policy --role-name clark-email-gateway-deployer \
+     --policy-name gateway-deploy --policy-document file:///tmp/perms.json
+
+   aws iam get-role --role-name clark-email-gateway-deployer \
+     --query Role.Arn --output text   # <- the role ARN for the next step
+   ```
+
+4. **Tell the workflow the role ARN** (GitHub repo *variable*, not a secret —
+   it's just an ARN). Either in the UI (repo → Settings → Secrets and variables
+   → Actions → **Variables** → New: `AWS_DEPLOY_ROLE_ARN` = the ARN), or:
+
+   ```bash
+   gh variable set AWS_DEPLOY_ROLE_ARN \
+     --repo WillcrestPartners/clark-email-send \
+     --body arn:aws:iam::626928146978:role/clark-email-gateway-deployer
+   ```
+
+5. **Protect `main`** (recommended for this security-critical service): repo →
+   Settings → Branches → add a rule for `main` requiring a pull request +
+   review before merge, so an auto-deploy always corresponds to a reviewed
+   change.
+
+After this, every merge to `main` deploys the gateway. Watch a run under the
+repo's **Actions** tab; a green run ends with `Successfully created/updated
+stack` (or "No changes to deploy").

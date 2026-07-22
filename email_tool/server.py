@@ -24,6 +24,7 @@ import audit_log
 import clark_client
 import diagnostics
 import gmail_client
+import oauth
 import poller
 
 load_dotenv()
@@ -49,10 +50,16 @@ mcp = FastMCP(
 
 SENDER = os.environ.get("SENDER_EMAIL", "clark@willcrestpartners.com")
 
+# Caller identity is resolved by the OAuth middleware (oauth.py) from the
+# connector's bearer token — no tool takes a caller_email argument anymore
+# (specs/connector-oauth.md in willcrestpartners/clark). During the cutover
+# window (CONNECTOR_AUTH_REQUIRED=false) a legacy self-asserted caller_email
+# in the request body is still honored when no token is present; a forged
+# caller_email argument is otherwise ignored entirely.
+
 
 @mcp.tool()
 def send_email(
-    caller_email: str,
     to: str,
     subject: str,
     body: str,
@@ -66,12 +73,14 @@ def send_email(
     Second call: confirmed=True -> actually sends the email.
 
     Args:
-        caller_email: The email address of the person requesting the send.
         to: Recipient email address.
         subject: Email subject line.
         body: Email body text.
         confirmed: Must be True to actually send. Use False first to show preview.
     """
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     try:
         access_control.get_user(caller_email)
         access_control.check_daily_limit(caller_email)
@@ -114,13 +123,13 @@ def send_email(
 
 
 @mcp.tool()
-def show_dashboard(caller_email: str) -> str:
+def show_dashboard() -> str:
     """
     Admin-only: show current settings, authorized users, and recent activity.
-
-    Args:
-        caller_email: Must be an admin user.
     """
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     if not access_control.is_admin(caller_email):
         return f"Access denied. {caller_email} does not have admin privileges."
 
@@ -162,28 +171,28 @@ def show_dashboard(caller_email: str) -> str:
 
 
 @mcp.tool()
-def run_diagnostics(caller_email: str) -> str:
+def run_diagnostics() -> str:
     """
     Run a full diagnostic check on the Clark Email Tool.
 
     Tests server health (credentials, Gmail scopes, mailbox access) and
     caller status (authorization, account active, daily limit, guardrails).
     Available to all callers — no authorization required to run diagnostics.
-
-    Args:
-        caller_email: Your email address (used to check your specific access and limits).
     """
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     return diagnostics.run_all(caller_email)
 
 
 @mcp.tool()
-def check_my_access(caller_email: str) -> str:
+def check_my_access() -> str:
     """
     Check your own access status and remaining sends for today.
-
-    Args:
-        caller_email: Your email address.
     """
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     try:
         user = access_control.get_user(caller_email)
         remaining = access_control.check_daily_limit(caller_email)
@@ -200,17 +209,17 @@ def check_my_access(caller_email: str) -> str:
 # ── inbound command-bus tools (Phase 1) ─────────────────────────────────────
 
 @mcp.tool()
-def poll_inbox(caller_email: str) -> str:
+def poll_inbox() -> str:
     """
     Admin-only: trigger one inbound poll sweep now and return a summary.
 
     The gateway normally polls on a timer; this forces an immediate sweep
     (list unread mail, gate, and route to Clark). Runs NO LLM — gating is
     deterministic and intent classification happens in Clark.
-
-    Args:
-        caller_email: Must be an admin user.
     """
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     if not access_control.is_admin(caller_email):
         return f"Access denied. {caller_email} does not have admin privileges."
 
@@ -234,12 +243,11 @@ def poll_inbox(caller_email: str) -> str:
 
 
 @mcp.tool()
-def verify_sender(caller_email: str, from_email: str) -> str:
+def verify_sender(from_email: str) -> str:
     """
     Report whether an address is on the cached inbound allow-list.
 
     Args:
-        caller_email: Your email address.
         from_email: The address to check against Clark's authorized-sender list.
     """
     import gateway_gate
@@ -272,17 +280,19 @@ def _connector_base() -> str:
 
 
 @mcp.tool()
-def search_companies(caller_email: str, query: str) -> str:
+def search_companies(query: str) -> str:
     """
     Search Clark for companies that may already exist, so a CIM is not
     duplicated. Matches on company name, project (deal codename), and aliases.
 
     Args:
-        caller_email: Your email address (must be an authorized Clark user).
         query: Company name or deal codename to look up.
     """
     import urllib.parse
 
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     base = _connector_base()
     secret = os.environ.get("CLARK_INBOUND_HMAC_SECRET", "")
     if not base or not secret:
@@ -309,17 +319,19 @@ def search_companies(caller_email: str, query: str) -> str:
 
 
 @mcp.tool()
-def analyze_cim(caller_email: str, dropbox_folder_path: str) -> str:
+def analyze_cim(dropbox_folder_path: str) -> str:
     """
     Locate the CIM in a Dropbox deal folder and extract its facts (server-side;
     the PDF is never uploaded through the chat). Returns the extracted JSON for
     you to review with the user before submitting.
 
     Args:
-        caller_email: Your email address (must be an authorized Clark user).
         dropbox_folder_path: Full Dropbox folder path, e.g.
             "/Willcrest - Sourcing/Opportunities/Franklin Alliance".
     """
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     base = _connector_base()
     secret = os.environ.get("CLARK_INBOUND_HMAC_SECRET", "")
     if not base or not secret:
@@ -345,14 +357,13 @@ def analyze_cim(caller_email: str, dropbox_folder_path: str) -> str:
 
 
 @mcp.tool()
-def submit_cim_intake(caller_email: str, payload_json: str) -> str:
+def submit_cim_intake(payload_json: str) -> str:
     """
     Submit the user-confirmed CIM data to Clark. Creates a single approval
     request and returns one-tap Approve/Reject links to show the user IN THIS
     CHAT — nothing is written to Clark until they approve.
 
     Args:
-        caller_email: Your email address (must be an authorized Clark user).
         payload_json: A JSON string with the confirmed intake, shape:
             {
               "company": {"mode": "create"|"update", "company_id"?, "name",
@@ -366,6 +377,9 @@ def submit_cim_intake(caller_email: str, payload_json: str) -> str:
     """
     import json as _json
 
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     base = _connector_base()
     secret = os.environ.get("CLARK_INBOUND_HMAC_SECRET", "")
     if not base or not secret:
@@ -401,8 +415,9 @@ def submit_cim_intake(caller_email: str, payload_json: str) -> str:
 # ── mobile/voice connector tools ────────────────────────────────────────────
 # Thin, signed proxies over Clark's /api/connector/* routes that back the Cowork
 # mobile/voice UI (spec: specs/mobile-voice-interface.md; skill: skills/clark in
-# willcrestpartners/clark). Same contract as the CIM trio above: caller_email is
-# passed through and Clark enforces the authorized-user allow-list + app-layer
+# willcrestpartners/clark). Same contract as the CIM trio above: the gateway
+# resolves caller_email from the connector's OAuth token (oauth.py) and passes
+# it through; Clark enforces the authorized-user allow-list + app-layer
 # permissions server-side; GET signs the empty body, POST signs the raw JSON
 # body; both reuse CLARK_INBOUND_HMAC_SECRET over CLARK_CONNECTOR_BASE_URL. The
 # gateway stays a thin transport (no parsing, no LLM, no DB) and returns each
@@ -449,7 +464,6 @@ def _connector_result(action: str, status: int, data) -> str:
 
 @mcp.tool()
 def search_contacts(
-    caller_email: str,
     q: str = "",
     role: str = "",
     city: str = "",
@@ -462,7 +476,6 @@ def search_contacts(
     Provide AT LEAST ONE filter; combine them to narrow the shortlist.
 
     Args:
-        caller_email: Your email address (must be an authorized Clark user).
         q: Free-text name or email fragment (e.g. "Jane Smith", "acme.com").
         role: Contact role/type filter (e.g. "Broker", "Lender"); must be a
             valid Clark contact role.
@@ -472,6 +485,9 @@ def search_contacts(
     """
     import urllib.parse
 
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     base, secret = _connector_env()
     if not base:
         return _CONNECTOR_UNCONFIGURED
@@ -492,18 +508,20 @@ def search_contacts(
 
 
 @mcp.tool()
-def get_contact(caller_email: str, contact_id: str) -> str:
+def get_contact(contact_id: str) -> str:
     """
     Pull a single contact's full record from Clark by id — phone/mobile, email,
     company, role, and recent activity for call-prep. Get the id first from
     search_contacts.
 
     Args:
-        caller_email: Your email address (must be an authorized Clark user).
         contact_id: The contact's Clark id (UUID).
     """
     import urllib.parse
 
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     base, secret = _connector_env()
     if not base:
         return _CONNECTOR_UNCONFIGURED
@@ -515,17 +533,19 @@ def get_contact(caller_email: str, contact_id: str) -> str:
 
 
 @mcp.tool()
-def get_company(caller_email: str, company_id: str) -> str:
+def get_company(company_id: str) -> str:
     """
     Pull a single company/deal record from Clark by id — profile, financials,
     banker, key contacts, and status. Get the id first from search_companies.
 
     Args:
-        caller_email: Your email address (must be an authorized Clark user).
         company_id: The company's Clark id (UUID).
     """
     import urllib.parse
 
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     base, secret = _connector_env()
     if not base:
         return _CONNECTOR_UNCONFIGURED
@@ -537,7 +557,7 @@ def get_company(caller_email: str, company_id: str) -> str:
 
 
 @mcp.tool()
-def submit_contact(caller_email: str, payload_json: str, source_text: str = "") -> str:
+def submit_contact(payload_json: str, source_text: str = "") -> str:
     """
     Add a person to Clark (a new relationship, a recruiting candidate, a banker
     met at a conference), optionally with the company they belong to and a first
@@ -546,7 +566,6 @@ def submit_contact(caller_email: str, payload_json: str, source_text: str = "") 
     Clark until they approve.
 
     Args:
-        caller_email: Your email address (must be an authorized Clark user).
         payload_json: A JSON string with the confirmed contact, shape:
             {
               "contact": {"first_name"*, "last_name"*, "title"?, "role"?,
@@ -562,6 +581,9 @@ def submit_contact(caller_email: str, payload_json: str, source_text: str = "") 
     """
     import json as _json
 
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     base, secret = _connector_env()
     if not base:
         return _CONNECTOR_UNCONFIGURED
@@ -580,7 +602,7 @@ def submit_contact(caller_email: str, payload_json: str, source_text: str = "") 
 
 
 @mcp.tool()
-def submit_activity(caller_email: str, payload_json: str, source_text: str = "") -> str:
+def submit_activity(payload_json: str, source_text: str = "") -> str:
     """
     Log a call or meeting note in Clark, or re-code an existing activity's links.
     Use for "log a call with…", "add a note to…", dictated call notes. Names can
@@ -590,7 +612,6 @@ def submit_activity(caller_email: str, payload_json: str, source_text: str = "")
     is written until they approve.
 
     Args:
-        caller_email: Your email address (must be an authorized Clark user).
         payload_json: A JSON string, shape:
             {
               "activity_id"?,      // present = UPDATE mode (edit / re-code links)
@@ -605,6 +626,9 @@ def submit_activity(caller_email: str, payload_json: str, source_text: str = "")
     """
     import json as _json
 
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     base, secret = _connector_env()
     if not base:
         return _CONNECTOR_UNCONFIGURED
@@ -623,7 +647,7 @@ def submit_activity(caller_email: str, payload_json: str, source_text: str = "")
 
 
 @mcp.tool()
-def sync_granola(caller_email: str, folder: str = "") -> str:
+def sync_granola(folder: str = "") -> str:
     """
     Pull in recent Granola call/meeting notes from the team folders and import
     them into Clark as activities. Use for "sync my Granola notes", "pull in the
@@ -631,9 +655,11 @@ def sync_granola(caller_email: str, folder: str = "") -> str:
     team folders, or name one to scope the run.
 
     Args:
-        caller_email: Your email address (must be an authorized Clark user).
         folder: Optional team-folder name to limit the sync to.
     """
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     base, secret = _connector_env()
     if not base:
         return _CONNECTOR_UNCONFIGURED
@@ -647,18 +673,18 @@ def sync_granola(caller_email: str, folder: str = "") -> str:
 
 
 @mcp.tool()
-def list_pending_approvals(caller_email: str) -> str:
+def list_pending_approvals() -> str:
     """
     Show what's waiting for the user's approval in Clark — "anything waiting for
     my approval?", "what's in my approval queue?". Returns the pending requests
     (newest first) with their id, risk level, and summary so the user can then
     approve or reject one by id via act_on_approval.
-
-    Args:
-        caller_email: Your email address (must be an authorized Clark user).
     """
     import urllib.parse
 
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     base, secret = _connector_env()
     if not base:
         return _CONNECTOR_UNCONFIGURED
@@ -670,7 +696,7 @@ def list_pending_approvals(caller_email: str) -> str:
 
 
 @mcp.tool()
-def act_on_approval(caller_email: str, approval_id: str, decision: str) -> str:
+def act_on_approval(approval_id: str, decision: str) -> str:
     """
     Approve or reject a pending Clark approval by id. Call this ONLY on the
     user's explicit spoken/typed approve-or-reject instruction — never on your
@@ -680,10 +706,12 @@ def act_on_approval(caller_email: str, approval_id: str, decision: str) -> str:
     request that was already decided returns its current status.
 
     Args:
-        caller_email: Your email address (must be an authorized Clark user).
         approval_id: The id of the approval to act on (from list_pending_approvals).
         decision: Either "approve" or "reject".
     """
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     base, secret = _connector_env()
     if not base:
         return _CONNECTOR_UNCONFIGURED
@@ -697,7 +725,6 @@ def act_on_approval(caller_email: str, approval_id: str, decision: str) -> str:
 
 @mcp.tool()
 def send_approval_notification(
-    caller_email: str,
     to: str,
     subject: str,
     body: str,
@@ -711,13 +738,15 @@ def send_approval_notification(
     This is a thin wrapper over the same threaded send used by the /send relay.
 
     Args:
-        caller_email: Must be an admin user.
         to: Recipient email address.
         subject: Email subject line.
         body: Email body text.
         in_reply_to: Optional Message-ID to set as In-Reply-To (threading).
         references: Optional References header value (threading).
     """
+    caller_email, err = oauth.caller_email()
+    if err:
+        return err
     if not access_control.is_admin(caller_email):
         return f"Access denied. {caller_email} does not have admin privileges."
 
@@ -737,7 +766,6 @@ def send_approval_notification(
 # ── ASGI app factory (shared by the local server and the Lambda web handler) ─
 
 import asyncio
-import hmac as _hmac
 import json
 from contextlib import asynccontextmanager
 from starlette.applications import Starlette
@@ -745,39 +773,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, Mount
 
-
-def _token_guard(app, token: str):
-    """Optional shared-secret gate for the MCP mount.
-
-    The Function URL is public (AuthType NONE) and MCP tools trust a
-    self-asserted caller_email, so URL secrecy is otherwise the only barrier.
-    When GATEWAY_MCP_TOKEN is set (via the clark/email-gateway secret), /mcp
-    requires `Authorization: Bearer <token>` or `X-Clark-Gateway-Token:
-    <token>`; when unset, behavior is unchanged (opt-in so enabling it can be
-    coordinated with the Cowork connector's header config). /send is not
-    gated — it has its own HMAC check.
-    """
-    if not token:
-        return app
-
-    async def guarded(scope, receive, send):
-        if scope["type"] == "http":
-            headers = {k.decode("latin-1").lower(): v.decode("latin-1")
-                       for k, v in scope.get("headers", [])}
-            supplied = headers.get("authorization", "")
-            if supplied.lower().startswith("bearer "):
-                supplied = supplied[7:]
-            else:
-                supplied = headers.get("x-clark-gateway-token", "")
-            if not _hmac.compare_digest(supplied, token):
-                await send({"type": "http.response.start", "status": 401,
-                            "headers": [(b"content-type", b"application/json")]})
-                await send({"type": "http.response.body",
-                            "body": b'{"error": "unauthorized"}'})
-                return
-        await app(scope, receive, send)
-
-    return guarded
+# (The old GATEWAY_MCP_TOKEN shared-secret guard was removed here: it was
+# opt-in, never enabled in production, and is superseded by the per-user
+# OAuth middleware in oauth.py. If the clark/email-gateway secret still
+# carries a GATEWAY_MCP_TOKEN key it is now ignored.)
 
 
 def build_app(run_poller: bool = True) -> Starlette:
@@ -825,6 +824,36 @@ def build_app(run_poller: bool = True) -> Starlette:
             "inbound_enabled": bool(inbound.get("enabled")),
             "last_successful_poll": poller.last_successful_poll(),
         })
+
+    # ── OAuth discovery (RFC 9728 / MCP auth) — public, no auth required ────
+    # claude.ai resolves the authorization server from these documents:
+    # 401 on /mcp -> WWW-Authenticate.resource_metadata -> protected-resource
+    # metadata -> Cognito issuer (its OIDC config names all real endpoints).
+
+    async def oauth_protected_resource(request: Request) -> Response:
+        base = oauth.host_base(request.scope)
+        return JSONResponse(
+            oauth.protected_resource_metadata(base),
+            headers=oauth.WELL_KNOWN_HEADERS,
+        )
+
+    async def oauth_as_metadata(request: Request) -> Response:
+        # Served only with the DCR shim on (Cognito has no RFC 7591 endpoint):
+        # mirrors the pool's OIDC metadata with registration pointed at /register.
+        base = oauth.host_base(request.scope)
+        meta = oauth.authorization_server_metadata(base)
+        if meta is None:
+            return JSONResponse({"error": "authorization server metadata unavailable"},
+                                status_code=503)
+        return JSONResponse(meta, headers=oauth.WELL_KNOWN_HEADERS)
+
+    async def oauth_register(request: Request) -> Response:
+        try:
+            body = json.loads((await request.body()).decode("utf-8") or "{}")
+        except Exception:
+            body = {}
+        return JSONResponse(oauth.register_response(body), status_code=201,
+                            headers=oauth.WELL_KNOWN_HEADERS)
 
     async def send_relay(request: Request) -> Response:
         """Outbound relay: Clark POSTs replies here; we send them threaded.
@@ -875,14 +904,32 @@ def build_app(run_poller: bool = True) -> Starlette:
             audit_log.log_attempt("clark-relay", to, subject, "failed", reason=str(e))
             return JSONResponse({"error": str(e)}, status_code=502)
 
-    app = Starlette(
-        lifespan=lifespan,
-        routes=[
-            Route("/health", health, methods=["GET"]),
-            Route("/send", send_relay, methods=["POST"]),
-            Mount("/", _token_guard(mcp_app, os.environ.get("GATEWAY_MCP_TOKEN", ""))),
-        ],
-    )
+    routes = [
+        Route("/health", health, methods=["GET"]),
+        Route("/send", send_relay, methods=["POST"]),
+        Route("/.well-known/oauth-protected-resource",
+              oauth_protected_resource, methods=["GET"]),
+        # Path-suffixed variant (RFC 9728 for resource "/mcp") — some clients
+        # request the metadata at the resource-specific path.
+        Route("/.well-known/oauth-protected-resource/mcp",
+              oauth_protected_resource, methods=["GET"]),
+    ]
+    if oauth.dcr_shim_enabled():
+        routes += [
+            Route("/.well-known/oauth-authorization-server",
+                  oauth_as_metadata, methods=["GET"]),
+            Route("/.well-known/oauth-authorization-server/mcp",
+                  oauth_as_metadata, methods=["GET"]),
+            Route("/.well-known/openid-configuration",
+                  oauth_as_metadata, methods=["GET"]),
+            Route("/register", oauth_register, methods=["POST"]),
+        ]
+    # The MCP mount goes last and is the only thing behind the OAuth
+    # middleware — /send keeps HMAC, /health stays public, and the poller
+    # never routes through here at all.
+    routes.append(Mount("/", oauth.middleware(mcp_app)))
+
+    app = Starlette(lifespan=lifespan, routes=routes)
 
     return app
 

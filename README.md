@@ -52,10 +52,13 @@ signature, 5xx on send failure.
 | `send_approval_notification` | Admins | Manually relay a (threaded) reply from clark@. |
 
 **Connector-backed tools** (CIM intake + the Cowork mobile/voice UI). Thin,
-HMAC-signed proxies over Clark's `/api/connector/*` routes — `caller_email` is
-passed through and Clark enforces the authorized-user allow-list and app-layer
+HMAC-signed proxies over Clark's `/api/connector/*` routes. The caller's
+identity comes from the connector's **per-user OAuth login** (`oauth.py` —
+Cognito access token verified on every `/mcp` call; no tool takes a
+`caller_email` argument); the gateway injects the verified email into the
+signed request and Clark enforces the authorized-user allow-list and app-layer
 permissions server-side. All reuse `CLARK_INBOUND_HMAC_SECRET` +
-`CLARK_CONNECTOR_BASE_URL`; no new infra or auth model.
+`CLARK_CONNECTOR_BASE_URL`.
 
 | Tool | Who | What |
 |---|---|---|
@@ -85,6 +88,11 @@ permissions server-side. All reuse `CLARK_INBOUND_HMAC_SECRET` +
 | `GATEWAY_SECRETS_ARN` | Secrets Manager ARN (`clark/email-gateway`); `bootstrap.py` loads its JSON keys into env at cold start. |
 | `MCP_STATELESS_HTTP` | `true` in the Lambda web function (stateless MCP over the Function URL). |
 | `PORT` | Port uvicorn listens on. `8080` locally/ECS and under Lambda (the LWA forwards Function URL requests to uvicorn on this port). |
+| `CONNECTOR_AUTH_REQUIRED` | Per-user OAuth cutover flag for `/mcp` (`oauth.py`). `false` = verify+inject identity when a token is present, legacy self-asserted `caller_email` still honored; `true` = 401 without a valid Cognito token. |
+| `CONNECTOR_COGNITO_POOL_ID` | Cognito user pool id (ClarkAuth `UserPoolId` output) — derives the token issuer. |
+| `CONNECTOR_COGNITO_DOMAIN` | Cognito Hosted UI base URL (ClarkAuth `HostedUiDomain` output) — its `/oauth2/userInfo` validates tokens and resolves the email. |
+| `CONNECTOR_CLIENT_ID` | `clark-connector` app client id (ClarkAuth `ConnectorClientId` output). |
+| `CONNECTOR_DCR_SHIM` | Serve the static client-registration shim (`/register` + AS metadata). Only if claude.ai's manual-credentials path is unavailable; default `false`. |
 
 **New config block** (`inbound` in APP_CONFIG_JSON / config.json):
 
