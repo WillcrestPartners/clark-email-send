@@ -570,13 +570,17 @@ def submit_contact(payload_json: str, source_text: str = "") -> str:
             {
               "contact": {"first_name"*, "last_name"*, "title"?, "role"?,
                           "email"?, "secondary_email"?, "phone"?, "mobile"?,
-                          "city"?, "state"?, "specialty"?, "description"?},
+                          "city"?, "state"?, "specialty"?, "bio"?,
+                          "bio_webpage"?, "whiteboard"?},
               "company"?: {"mode": "existing", "company_id"}
                         | {"mode": "create", "name", "fields"?},
               "activity"?: {"activity_type"?, "subject"*, "notes"?,
                             "activity_date"?}
             }
             (* required). Risk is Medium when company.mode='create', else Low.
+            bio_webpage is a URL (LinkedIn/bio page); free-form relationship
+            notes belong in whiteboard. Unknown contact fields are rejected
+            with the list of valid ones (there is no description field).
         source_text: Optional raw text the contact was dictated/derived from.
     """
     import json as _json
